@@ -1,0 +1,234 @@
+"""BackwardResolver behavior: every requirement 3.1 instruction form, plus
+merge/divergence and budget-exceeded semantics."""
+
+from idanalysister.core.diagnostics import UnknownReason
+from idanalysister.core.engine_backward import BackwardResolver
+from idanalysister.core.ida_types import BasicBlockInfo
+from idanalysister.core.insn_cache import InstructionCache
+from idanalysister.core.values import Concrete, MemoryRef, Symbolic, Unknown
+from idanalysister.locators.base import default_registry
+
+from ..conftest import EAX, EBX, ECX, EDX, ESI, imm, insn, mem_direct, mem_displ, mem_phrase, reg
+
+FUNC = 0x401000
+END = 0x401100
+
+
+def make_resolver(port, **kwargs):
+    cache = InstructionCache(port)
+    return BackwardResolver(port, cache, default_registry(), **kwargs)
+
+
+def linear_block(port, func_ea=FUNC, end_ea=END):
+    port.set_function(func_ea, end_ea, blocks=(BasicBlockInfo(func_ea, end_ea, (), ()),))
+
+
+# -- form #1: register direct passing -------------------------------------------------
+def test_register_direct_mov_reg_reg(port):
+    port.add_instructions(
+        [
+            insn(0x401000, "mov", 5, [reg(0, EAX), imm(1, 0x1234)]),
+            insn(0x401005, "mov", 2, [reg(0, EBX), reg(1, EAX)]),
+        ]
+    )
+    linear_block(port)
+    result = make_resolver(port).resolve_register(EBX, 0x401007)
+    assert result == Concrete(0x1234, result.kind)
+
+
+# -- form #2: immediate direct passing ------------------------------------------------
+def test_immediate_direct(port):
+    port.add_instructions([insn(0x401000, "mov", 5, [reg(0, EAX), imm(1, 0x5678)])])
+    linear_block(port)
+    result = make_resolver(port).resolve_register(EAX, 0x401005)
+    assert isinstance(result, Concrete) and result.value == 0x5678
+
+
+# -- form #3: memory indirect passing (must dereference) ------------------------------
+def test_memory_indirect_dereferences_global(port):
+    port.set_memory(0x403000, (0xABCDEF).to_bytes(4, "little"))
+    port.add_instructions([insn(0x401000, "mov", 5, [reg(0, EAX), mem_direct(1, 0x403000)])])
+    linear_block(port)
+    result = make_resolver(port).resolve_register(EAX, 0x401005)
+    assert isinstance(result, MemoryRef)
+    assert result.addr == 0x403000
+    assert isinstance(result.value, Concrete) and result.value.value == 0xABCDEF
+
+
+def test_memory_read_failure_is_unknown_not_crash(port):
+    port.add_instructions([insn(0x401000, "mov", 5, [reg(0, EAX), mem_direct(1, 0x999000)])])
+    linear_block(port)
+    result = make_resolver(port).resolve_register(EAX, 0x401005)
+    assert isinstance(result, MemoryRef)
+    assert isinstance(result.value, Unknown)
+    assert result.value.reason is UnknownReason.MEMORY_READ_FAILED
+
+
+# -- form #6: register indirect addressing --------------------------------------------
+def test_register_indirect_write_then_read(port):
+    port.add_instructions(
+        [
+            insn(0x401000, "mov", 5, [reg(0, EAX), imm(1, 0x404000)]),
+            insn(0x401005, "mov", 6, [mem_displ(0, EAX, 0x10), imm(1, 0x123)]),
+            insn(0x40100B, "mov", 3, [reg(0, ECX), mem_displ(1, EAX, 0x10)]),
+        ]
+    )
+    linear_block(port)
+    result = make_resolver(port).resolve_register(ECX, 0x40100E)
+    assert isinstance(result, Concrete) and result.value == 0x123
+
+
+# -- form #7: TLS / global passing ------------------------------------------------------
+def test_tls_style_segment_operand_reads_configured_memory(port):
+    port.set_memory(0x30, (0xCAFEBABE).to_bytes(4, "little"))
+    port.add_instructions([insn(0x401000, "mov", 6, [reg(0, EAX), mem_direct(1, 0x30, segment_name="gs")])])
+    linear_block(port)
+    result = make_resolver(port).resolve_register(EAX, 0x401006)
+    assert isinstance(result, MemoryRef) and result.value.value == 0xCAFEBABE
+
+
+# -- form #8: prior call's return value used as argument -------------------------------
+def test_call_return_value_chained_through_register_copy(port):
+    port.add_instructions(
+        [
+            insn(0x401000, "call", 5, [mem_direct(0, 0x402000)], written=(False,)),
+            insn(0x401005, "mov", 2, [reg(0, EBX), reg(1, EAX)]),
+        ]
+    )
+    linear_block(port)
+    result = make_resolver(port).resolve_register(EBX, 0x401007)
+    assert isinstance(result, Symbolic)
+    assert result.expr == "ret(0x401000)"
+
+
+# -- xchg / cmov / lea / add-sub (form #9 rare forms) -----------------------------------
+def test_xchg_swaps_registers(port):
+    port.add_instructions(
+        [
+            insn(0x401000, "mov", 5, [reg(0, EAX), imm(1, 1)]),
+            insn(0x401005, "mov", 5, [reg(0, EBX), imm(1, 2)]),
+            insn(0x40100A, "xchg", 2, [reg(0, EAX), reg(1, EBX)], written=(True, True)),
+        ]
+    )
+    linear_block(port)
+    resolver = make_resolver(port)
+    assert resolver.resolve_register(EAX, 0x40100C).value == 2
+    assert resolver.resolve_register(EBX, 0x40100C).value == 1
+
+
+def test_cmov_is_divergent_not_guessed(port):
+    port.add_instructions(
+        [
+            insn(0x401000, "mov", 5, [reg(0, EAX), imm(1, 1)]),
+            insn(0x401005, "mov", 5, [reg(0, EBX), imm(1, 2)]),
+            insn(0x40100A, "cmovz", 3, [reg(0, EAX), reg(1, EBX)]),
+        ]
+    )
+    linear_block(port)
+    result = make_resolver(port).resolve_register(EAX, 0x40100D)
+    assert isinstance(result, Unknown) and result.reason is UnknownReason.DIVERGENT_PATHS
+
+
+def test_lea_computes_address_without_dereferencing(port):
+    port.add_instructions(
+        [
+            insn(0x401000, "mov", 5, [reg(0, EAX), imm(1, 0x404000)]),
+            insn(0x401005, "lea", 3, [reg(0, ECX), mem_displ(1, EAX, 0x20)]),
+        ]
+    )
+    linear_block(port)
+    result = make_resolver(port).resolve_register(ECX, 0x401008)
+    assert isinstance(result, Concrete) and result.value == 0x404020
+
+
+def test_add_sub_constant_folding(port):
+    port.add_instructions(
+        [
+            insn(0x401000, "mov", 5, [reg(0, EAX), imm(1, 100)]),
+            insn(0x401005, "add", 3, [reg(0, EAX), imm(1, 5)]),
+            insn(0x401008, "sub", 3, [reg(0, EAX), imm(1, 2)]),
+        ]
+    )
+    linear_block(port)
+    result = make_resolver(port).resolve_register(EAX, 0x40100B)
+    assert isinstance(result, Concrete) and result.value == 103
+
+
+# -- unsupported instruction -> Unknown, never a crash ----------------------------------
+def test_unrecognized_instruction_yields_unknown(port):
+    port.add_instructions([insn(0x401000, "vpternlogd", 6, [reg(0, EAX), imm(1, 1)])])
+    linear_block(port)
+    result = make_resolver(port).resolve_register(EAX, 0x401006)
+    assert isinstance(result, Unknown) and result.reason is UnknownReason.UNSUPPORTED_INSTRUCTION
+
+
+def test_no_definition_reaches_function_entry(port):
+    port.add_instructions([insn(0x401000, "nop", 1, [])])
+    linear_block(port)
+    result = make_resolver(port).resolve_register(EAX, 0x401001)
+    assert isinstance(result, Unknown) and result.reason is UnknownReason.NO_DEFINITION_FOUND
+
+
+# -- merge at branches: agree vs. diverge -----------------------------------------------
+def test_merge_agreeing_paths_stays_concrete(port):
+    # entry -> {left, right} -> join ; both branches set eax = 7
+    port.add_instructions(
+        [
+            insn(0x401000, "jz", 5, [mem_direct(0, 0x401010)], written=(False,)),
+            insn(0x401005, "mov", 5, [reg(0, EAX), imm(1, 7)]),  # left branch
+            insn(0x401010, "mov", 5, [reg(0, EAX), imm(1, 7)]),  # right branch
+            insn(0x401015, "mov", 2, [reg(0, EBX), reg(1, EAX)]),  # join point use
+        ]
+    )
+    blocks = (
+        BasicBlockInfo(0x401000, 0x401005, succ_starts=(0x401005, 0x401010), pred_starts=()),
+        BasicBlockInfo(0x401005, 0x40100A, succ_starts=(0x401015,), pred_starts=(0x401000,)),
+        BasicBlockInfo(0x401010, 0x401015, succ_starts=(0x401015,), pred_starts=(0x401000,)),
+        BasicBlockInfo(0x401015, 0x40101A, succ_starts=(), pred_starts=(0x401005, 0x401010)),
+    )
+    port.set_function(FUNC, END, blocks=blocks)
+    result = make_resolver(port).resolve_register(EBX, 0x401017)
+    assert isinstance(result, Concrete) and result.value == 7
+
+
+def test_merge_disagreeing_paths_is_divergent(port):
+    port.add_instructions(
+        [
+            insn(0x401000, "jz", 5, [mem_direct(0, 0x401010)], written=(False,)),
+            insn(0x401005, "mov", 5, [reg(0, EAX), imm(1, 7)]),
+            insn(0x401010, "mov", 5, [reg(0, EAX), imm(1, 9)]),
+            insn(0x401015, "mov", 2, [reg(0, EBX), reg(1, EAX)]),
+        ]
+    )
+    blocks = (
+        BasicBlockInfo(0x401000, 0x401005, succ_starts=(0x401005, 0x401010), pred_starts=()),
+        BasicBlockInfo(0x401005, 0x40100A, succ_starts=(0x401015,), pred_starts=(0x401000,)),
+        BasicBlockInfo(0x401010, 0x401015, succ_starts=(0x401015,), pred_starts=(0x401000,)),
+        BasicBlockInfo(0x401015, 0x40101A, succ_starts=(), pred_starts=(0x401005, 0x401010)),
+    )
+    port.set_function(FUNC, END, blocks=blocks)
+    result = make_resolver(port).resolve_register(EBX, 0x401017)
+    assert isinstance(result, Unknown) and result.reason is UnknownReason.DIVERGENT_PATHS
+
+
+# -- budget exceeded: pathologically long chain still terminates -----------------------
+def test_budget_exceeded_on_long_chain(port):
+    ea = 0x401000
+    prev_reg = EAX
+    port.add_instructions([insn(ea, "mov", 5, [reg(0, EAX), imm(1, 1)])])
+    ea += 5
+    # Alternate EAX/EBX copies far beyond the default step budget.
+    for i in range(500):
+        src = EAX if prev_reg == EBX else EBX
+        dst = EBX if prev_reg == EBX else EAX
+        if i == 0:
+            port.add_instruction(insn(ea, "mov", 2, [reg(0, EBX), reg(1, EAX)]))
+            prev_reg = EBX
+        else:
+            port.add_instruction(insn(ea, "mov", 2, [reg(0, dst), reg(1, src)]))
+            prev_reg = dst
+        ea += 2
+    linear_block(port, end_ea=ea + 0x1000)
+    resolver = make_resolver(port, max_steps=50)
+    result = resolver.resolve_register(prev_reg, ea)
+    assert isinstance(result, Unknown) and result.reason is UnknownReason.BUDGET_EXCEEDED
