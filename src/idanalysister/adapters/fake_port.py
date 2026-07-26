@@ -80,10 +80,17 @@ class FakeIdaPort(IdaPort):
         candidates = [e for e in self._instructions if min_ea <= e < ea]
         return max(candidates) if candidates else None
 
+    #: Mnemonics treated as genuine call sites, mirroring
+    #: IdaPortImpl.code_refs_to's fl_CN/fl_CF/fl_JN/fl_JF: ordinary calls,
+    #: plus a bare unconditional `jmp` straight to the target (tail calls /
+    #: thunks). Conditional jumps (jz, jge, ...) are intra-function control
+    #: flow, not call sites, so they're deliberately excluded.
+    _CALL_SITE_MNEMONICS = ("call", "jmp")
+
     def code_refs_to(self, ea: int) -> tuple[int, ...]:
         refs = []
         for src_ea, insn in self._instructions.items():
-            if not insn.mnem.startswith("call"):
+            if not insn.mnem.startswith(self._CALL_SITE_MNEMONICS):
                 continue
             if any(op.addr == ea for op in insn.operands if op.addr is not None):
                 refs.append(src_ea)

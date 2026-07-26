@@ -57,6 +57,25 @@ def test_fastcall_register_indirect_and_immediate(port):
     assert site.argument(1).raw_value.value == 7
 
 
+def test_tail_call_via_unconditional_jmp_is_discovered_as_a_call_site(port):
+    # Regression test: a compiler-generated tail call (`jmp target` instead
+    # of `call target; ret`, e.g. the last statement in a small wrapper
+    # function, or an import/thunk stub) must still be found as a call
+    # site — IDA's own xref graph records it, and code_refs_to must not
+    # silently filter it out just because the instruction is a jmp.
+    port.add_instructions(
+        [
+            insn(0x402000, "push", 5, [imm(0, 0x99)], written=(False,)),
+            insn(0x402005, "jmp", 5, [mem_direct(0, FUNC)], written=(False,)),
+        ]
+    )
+    port.set_function(CALLER, CALLER_END, blocks=(BasicBlockInfo(CALLER, CALLER_END, (), ()),))
+    report = ParamExtractor(port=port).extract_calls(FUNC, convention=CDECL, num_args=1)
+    assert report.call_count == 1
+    assert report.call_sites[0].call_ea == 0x402005
+    assert report.call_sites[0].argument(0).raw_value.value == 0x99
+
+
 def test_call_return_chaining_with_c_string_postprocessor(port):
     port.set_memory(0x405000, b"hello\x00")
     port.add_instructions(

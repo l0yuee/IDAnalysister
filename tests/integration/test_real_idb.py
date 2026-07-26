@@ -47,6 +47,26 @@ def test_prior_call_return_value_chained(probe_functions):
     assert symbolic_sites[0].argument(0).raw_value.expr.startswith("ret(")
 
 
+def test_tail_call_via_jmp_is_discovered(probe_functions):
+    # Regression test for a real user-reported gap: a tail call compiled
+    # as `jmp target_func` (instead of `call target_func; ret`) was not
+    # being found by extract_calls, even though IDA's own xref view listed
+    # it — code_refs_to was filtering to fl_CN/fl_CF only. caller_tail_call
+    # in the fixture reproduces this pattern (`push 0x77; jmp target_func`).
+    import ida_funcs
+
+    extractor = ParamExtractor()
+    report = extractor.extract_calls(probe_functions["target_func"], convention=CDECL, num_args=1)
+    matches = [
+        s
+        for s in report.call_sites
+        if isinstance(s.argument(0).raw_value, Concrete) and s.argument(0).raw_value.value == 0x77
+    ]
+    assert matches, "expected the caller_tail_call jmp-based tail call (arg0 == 0x77) to be found"
+    pfn = ida_funcs.get_func(probe_functions["caller_tail_call"])
+    assert pfn.start_ea <= matches[0].call_ea < pfn.end_ea, "the discovered call site should be the jmp inside caller_tail_call"
+
+
 def test_forward_resolution_survives_decrypt_loop(probe_functions):
     import ida_funcs
     import idautils

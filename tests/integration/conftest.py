@@ -74,7 +74,14 @@ def probe_functions(ida_session):
     import ida_funcs
     import ida_name
 
-    names = ["target_func", "caller_push_seq", "caller_reg_indirect", "caller_return_chain", "decrypt_then_call"]
+    names = [
+        "target_func",
+        "caller_push_seq",
+        "caller_reg_indirect",
+        "caller_return_chain",
+        "decrypt_then_call",
+        "caller_tail_call",
+    ]
     result = {}
     for name in names:
         ea = ida_name.get_name_ea(0, name)

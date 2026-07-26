@@ -68,12 +68,22 @@ decrypt_then_call:
     add esp, 4
     ret
 
+; Tail call via unconditional jmp (compiler-generated tail-call
+; optimization / thunk pattern) instead of `call target; ret` — a genuine
+; call site whose arguments were prepared by this function, but recorded
+; in IDA's xref graph as a jump reference (fl_JN), not a call reference
+; (fl_CN). code_refs_to must not silently drop it.
+caller_tail_call:
+    push 0x77
+    jmp target_func
+
 _start:
     call caller_push_seq
     call caller_reg_indirect
     call caller_return_chain
     mov ecx, buffer
     call decrypt_then_call
+    call caller_tail_call
     mov eax, 1
     xor ebx, ebx
     int 0x80
