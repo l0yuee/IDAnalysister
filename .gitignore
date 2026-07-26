@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# IDA Pro databases and generated artifacts
+*.idb
+*.i64
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+*.asm.gen
+*.dmp
+
+# Integration test fixture build artifacts (rebuilt on demand from .asm)
+tests/integration/fixtures/probe
+tests/integration/fixtures/*.o
+
+# Test / tooling caches
+.pytest_cache/
+.hypothesis/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.log
