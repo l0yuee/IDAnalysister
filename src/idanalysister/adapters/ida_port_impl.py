@@ -85,9 +85,18 @@ class IdaPortImpl(IdaPort):
         import idautils
         import ida_xref
 
+        # fl_CN/fl_CF: ordinary `call` instructions. fl_JN/fl_JF: a `jmp`
+        # straight to the function's entry point from outside it — the
+        # standard compiler pattern for a tail call (the last statement in
+        # a function calling another is folded from `call X; ret` into
+        # `jmp X`) or a thunk/import stub whose entire body is one jump.
+        # Both are genuine call sites: the caller's own function set up
+        # the arguments identically either way, so omitting jump-type
+        # xrefs here would silently under-report call sites relative to
+        # what IDA's own xref graph (and UI) already knows about.
         refs = []
         for xref in idautils.XrefsTo(ea, 0):
-            if xref.type in (ida_xref.fl_CN, ida_xref.fl_CF):
+            if xref.type in (ida_xref.fl_CN, ida_xref.fl_CF, ida_xref.fl_JN, ida_xref.fl_JF):
                 refs.append(xref.frm)
         return tuple(sorted(set(refs)))
 
@@ -353,6 +362,7 @@ def _convert_instruction(insn) -> Instruction:
         written.append(bool(feature & chg_bits[number]))
 
     mnem = insn.get_canon_mnem() or ""
+    is_control_transfer = bool(feature & (ida_idp.CF_CALL | ida_idp.CF_JUMP | ida_idp.CF_STOP))
     return Instruction(
         ea=insn.ea,
         mnem=mnem.lower(),
@@ -360,6 +370,7 @@ def _convert_instruction(insn) -> Instruction:
         size=insn.size,
         operands=tuple(operands),
         operand_written=tuple(written),
+        is_control_transfer=is_control_transfer,
     )
 
 

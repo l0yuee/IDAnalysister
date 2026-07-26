@@ -8,7 +8,7 @@ from idanalysister.core.insn_cache import InstructionCache
 from idanalysister.core.values import Concrete, MemoryRef, Symbolic, Unknown
 from idanalysister.locators.base import default_registry
 
-from ..conftest import EAX, EBX, ECX, EDX, ESI, imm, insn, mem_direct, mem_displ, mem_phrase, reg
+from ..conftest import EAX, EBX, ECX, EDX, ESI, ESP, imm, insn, mem_direct, mem_displ, mem_phrase, reg
 
 FUNC = 0x401000
 END = 0x401100
@@ -232,3 +232,56 @@ def test_budget_exceeded_on_long_chain(port):
     resolver = make_resolver(port, max_steps=50)
     result = resolver.resolve_register(prev_reg, ea)
     assert isinstance(result, Unknown) and result.reason is UnknownReason.BUDGET_EXCEEDED
+
+
+# -- push sequence with a non-stack instruction interleaved before the call ------------
+def test_push_sequence_skips_transparent_instruction_before_call(port):
+    # Reproduces a real-world MSVC pattern: `/EHsc` unwind-state bookkeeping
+    # (`mov byte ptr [ebp+var_4], 1`) inserted between the last push and the
+    # call. Regression test for collect_push_sequence stopping too early.
+    port.add_instructions(
+        [
+            insn(0x401000, "push", 5, [imm(0, 0x0A)], written=(False,)),
+            insn(0x401005, "push", 5, [mem_direct(0, 0x407930)], written=(False,)),
+            insn(0x40100A, "mov", 4, [mem_displ(0, EBX, -4, size=1), imm(1, 1, size=1)]),
+            insn(0x40100E, "call", 6, [mem_direct(0, 0x407188)], written=(False,)),
+        ]
+    )
+    linear_block(port, end_ea=0x401100)
+    resolver = make_resolver(port)
+    pushes = resolver.collect_push_sequence(0x40100E)
+    assert pushes == [0x401000, 0x401005]
+
+
+def test_push_sequence_stops_at_a_real_control_flow_boundary(port):
+    # A genuine call/jmp interleaved between pushes must NOT be treated as
+    # transparent — only the trailing push(es) after it belong to this
+    # call's argument setup.
+    port.add_instructions(
+        [
+            insn(0x401000, "push", 5, [imm(0, 1)], written=(False,)),
+            insn(0x401005, "call", 5, [mem_direct(0, 0x402000)], written=(False,)),
+            insn(0x40100A, "push", 5, [imm(0, 2)], written=(False,)),
+            insn(0x40100F, "call", 6, [mem_direct(0, 0x407188)], written=(False,)),
+        ]
+    )
+    linear_block(port, end_ea=0x401100)
+    resolver = make_resolver(port)
+    pushes = resolver.collect_push_sequence(0x40100F)
+    assert pushes == [0x40100A]
+
+
+def test_push_sequence_stops_at_stack_pointer_write(port):
+    # A `mov [esp+N], X` (stack-offset write) between pushes changes the
+    # stack layout being described and must not be treated as transparent.
+    port.add_instructions(
+        [
+            insn(0x401000, "push", 5, [imm(0, 1)], written=(False,)),
+            insn(0x401005, "mov", 4, [mem_displ(0, ESP, 4), imm(1, 2)]),
+            insn(0x401009, "call", 6, [mem_direct(0, 0x407188)], written=(False,)),
+        ]
+    )
+    linear_block(port, end_ea=0x401100)
+    resolver = make_resolver(port)
+    pushes = resolver.collect_push_sequence(0x401009)
+    assert pushes == []

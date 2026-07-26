@@ -63,6 +63,17 @@ class Instruction:
     #: including ones with no dedicated `Locator` — rather than needing a
     #: hardcoded mnemonic list to know what counts as a definition site.
     operand_written: tuple[bool, ...] = field(default_factory=tuple)
+    #: Whether IDA's processor module flags this instruction as altering
+    #: control flow (`ida_idp`'s `CF_CALL | CF_JUMP | CF_STOP` feature
+    #: bits) — covers `call`, every jump variant (conditional or not),
+    #: `ret`/`iret`, and processor-specific equivalents generically,
+    #: without a hardcoded mnemonic list. Used to recognize where a
+    #: backward walk must stop treating intervening instructions as
+    #: transparent (e.g. `core.engine_backward.collect_push_sequence`
+    #: skipping over non-stack-touching instructions interleaved between
+    #: `push`es, such as MSVC's `/EHsc` unwind-state bookkeeping, while
+    #: still never walking through a real control-flow boundary).
+    is_control_transfer: bool = False
     func_ea: int | None = None  # owning function entry, if known
 
     @property

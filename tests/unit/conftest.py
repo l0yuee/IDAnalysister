@@ -60,9 +60,22 @@ def mem_phrase(number, base_reg, size=4):
     return Operand(kind=OperandKind.MEM_PHRASE, number=number, reg=base_reg, disp=0, dtype_size=size)
 
 
-def insn(ea, mnem, size, operands, written=None, itype=1):
+def insn(ea, mnem, size, operands, written=None, itype=1, is_control_transfer=None):
     """`written` defaults to True for operand 0 only (the common case),
-    False elsewhere — pass an explicit tuple to override."""
+    False elsewhere — pass an explicit tuple to override. `is_control_transfer`
+    defaults to True for call/jmp/j<cc>/ret mnemonics (mirroring IDA's own
+    CF_CALL|CF_JUMP|CF_STOP feature bits) and False otherwise — pass an
+    explicit bool to override."""
     if written is None:
         written = tuple(i == 0 for i in range(len(operands)))
-    return Instruction(ea=ea, mnem=mnem, itype=itype, size=size, operands=tuple(operands), operand_written=written)
+    if is_control_transfer is None:
+        is_control_transfer = mnem.startswith(("call", "jmp", "j", "ret"))
+    return Instruction(
+        ea=ea,
+        mnem=mnem,
+        itype=itype,
+        size=size,
+        operands=tuple(operands),
+        operand_written=written,
+        is_control_transfer=is_control_transfer,
+    )
