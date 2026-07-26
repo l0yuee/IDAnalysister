@@ -362,6 +362,7 @@ def _convert_instruction(insn) -> Instruction:
         written.append(bool(feature & chg_bits[number]))
 
     mnem = insn.get_canon_mnem() or ""
+    is_control_transfer = bool(feature & (ida_idp.CF_CALL | ida_idp.CF_JUMP | ida_idp.CF_STOP))
     return Instruction(
         ea=insn.ea,
         mnem=mnem.lower(),
@@ -369,6 +370,7 @@ def _convert_instruction(insn) -> Instruction:
         size=insn.size,
         operands=tuple(operands),
         operand_written=tuple(written),
+        is_control_transfer=is_control_transfer,
     )
 
 

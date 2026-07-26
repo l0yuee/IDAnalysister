@@ -36,6 +36,34 @@ _logger = get_logger("core.engine_backward")
 #: only guards against a pathological run of `push` mnemonics).
 _MAX_PUSH_SEQUENCE = 64
 
+#: Safety cap on how many non-push instructions `collect_push_sequence` will
+#: skip over looking for more pushes, independent of the general step
+#: budget — bounds the cost of scanning through unrelated code once the
+#: push sequence has clearly ended.
+_MAX_TRANSPARENT_SKIP = 16
+
+
+def _is_transparent_to_push_sequence(instr: Instruction, sp_reg: int | None) -> bool:
+    """Whether `instr` can be skipped over while scanning backward for a
+    push sequence without treating it as ending that sequence: it must not
+    alter control flow (call/jmp/ret/...) and must not write to the stack
+    pointer register or to stack-pointer-relative memory (which would mean
+    it's itself adjusting/using the stack in a way `collect_push_sequence`
+    doesn't model, e.g. a `mov [esp+N], reg` argument write — the
+    STACK_OFFSET convention path handles that shape, not this one)."""
+    if instr.is_control_transfer:
+        return False
+    if sp_reg is None:
+        return True
+    for op in instr.operands:
+        if not instr.is_written(op.number):
+            continue
+        if op.kind is OperandKind.REG and op.reg == sp_reg:
+            return False
+        if op.is_memory and op.reg == sp_reg:
+            return False
+    return True
+
 
 class _NotFound:
     """Sentinel distinguishing "no local write found, caller should decide
@@ -111,20 +139,34 @@ class BackwardResolver:
         return MemoryRef(addr=addr, value=Concrete(raw, ValueKind.INT))
 
     def collect_push_sequence(self, call_ea: int) -> list[int]:
-        """Addresses of contiguous `push` instructions immediately
-        preceding `call_ea`, in program (chronological) order — the last
-        element is the push closest to the call."""
+        """Addresses of `push` instructions preceding `call_ea`, in program
+        (chronological) order — the last element is the push closest to the
+        call. Non-`push` instructions interleaved between them are skipped
+        transparently as long as they don't touch the stack pointer or
+        alter control flow (see `_is_transparent_to_push_sequence`) — real
+        compiler output very commonly inserts unrelated bookkeeping (e.g.
+        MSVC's `/EHsc` unwind-state tracking, `mov [ebp+var], N`) between
+        the last argument push and the call itself."""
         func_ea = self._func_ea_for(call_ea)
         if func_ea is None:
             return []
+        sp_reg = self.port.stack_pointer_reg()
         pushes: list[int] = []
+        skipped = 0
         ea = self.port.prev_head(call_ea, func_ea)
-        while ea is not None and len(pushes) < _MAX_PUSH_SEQUENCE:
+        while ea is not None and len(pushes) < _MAX_PUSH_SEQUENCE and skipped < _MAX_TRANSPARENT_SKIP:
             instr = self.cache.get(ea)
-            if instr is None or instr.mnem != "push":
+            if instr is None:
                 break
-            pushes.append(ea)
-            ea = self.port.prev_head(ea, func_ea)
+            if instr.mnem == "push":
+                pushes.append(ea)
+                ea = self.port.prev_head(ea, func_ea)
+                continue
+            if _is_transparent_to_push_sequence(instr, sp_reg):
+                skipped += 1
+                ea = self.port.prev_head(ea, func_ea)
+                continue
+            break
         pushes.reverse()
         return pushes
 
