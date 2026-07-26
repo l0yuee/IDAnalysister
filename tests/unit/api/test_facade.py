@@ -7,13 +7,14 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from idanalysister import ParamExtractor
-from idanalysister.conventions.templates import CDECL, FASTCALL
+from idanalysister.conventions.templates import CDECL, FASTCALL, MS_X64
+from idanalysister.core.diagnostics import UnknownReason
 from idanalysister.core.ida_types import BasicBlockInfo
 from idanalysister.core.insn_model import OperandKind
-from idanalysister.core.values import Concrete, MemoryRef, Symbolic
+from idanalysister.core.values import Concrete, MemoryRef, Symbolic, Unknown
 from idanalysister.typespec.argtype import ArgTypeSpec
 
-from ..conftest import EAX, EBX, ECX, EDX, imm, insn, mem_direct, mem_displ, reg
+from ..conftest import EAX, EBX, ECX, EDX, RCX, imm, insn, mem_direct, mem_displ, reg
 
 FUNC = 0x401000
 CALLER = 0x402000
@@ -91,6 +92,40 @@ def test_multiple_call_sites_all_extracted(port):
     assert report.call_count == 2
     values = sorted(site.argument(0).raw_value.value for site in report.call_sites)
     assert values == [1, 2]
+
+
+def test_resolve_argument_at_through_facade_tracks_register_reassignment(port64):
+    # Regression test for a bug where the facade passed the whole
+    # CallingConvention into ForwardSymbolicEngine.resolve_at instead of
+    # the argument's concrete entry register — which happened to look
+    # correct whenever the value survived unchanged, but silently ignored
+    # any real reassignment. arg0 enters in rcx (MS x64 slot 0); it is
+    # unconditionally overwritten with a constant before the call, so the
+    # value at the call site must reflect that, not the original seed.
+    func_ea = 0x510000
+    call_ea = 0x510008
+    port64.add_instructions(
+        [
+            insn(0x510000, "mov", 5, [reg(0, RCX, 8), imm(1, 0x2A, 8)]),
+            insn(call_ea, "call", 5, [mem_direct(0, 0x600000, 8)], written=(False,)),
+        ]
+    )
+    port64.set_function(func_ea, 0x510100, blocks=(BasicBlockInfo(func_ea, 0x510100, (), ()),))
+    extractor = ParamExtractor(port=port64)
+    result = extractor.resolve_argument_at(func_ea, arg_index=0, target_ea=call_ea, convention=MS_X64, num_args=1)
+    assert isinstance(result, Concrete) and result.value == 0x2A
+
+
+def test_resolve_argument_at_stack_slot_is_unsupported_through_facade(port64):
+    # arg index beyond MS x64's 4 register slots is stack-passed; the
+    # facade must surface the engine's documented scope limit, not crash.
+    func_ea = 0x520000
+    call_ea = 0x520005
+    port64.add_instructions([insn(call_ea, "call", 5, [mem_direct(0, 0x600000, 8)], written=(False,))])
+    port64.set_function(func_ea, 0x520100, blocks=(BasicBlockInfo(func_ea, 0x520100, (), ()),))
+    extractor = ParamExtractor(port=port64)
+    result = extractor.resolve_argument_at(func_ea, arg_index=4, target_ea=call_ea, convention=MS_X64, num_args=5)
+    assert isinstance(result, Unknown) and result.reason is UnknownReason.UNSUPPORTED_OPERAND_SHAPE
 
 
 # -- crash resistance: random instruction soup must never raise -------------------------

@@ -90,9 +90,12 @@ class ParamExtractor:
         resolved_convention, resolved_num_args = self._resolve_convention(func_ea, convention, num_args)
         if arg_index < 0 or arg_index >= resolved_num_args:
             return unknown(UnknownReason.UNSUPPORTED_OPERAND_SHAPE, detail="argument index out of range")
+        slots = resolved_convention.slots(resolved_num_args, self.port)
+        slot = slots[arg_index]
+        initial_reg = slot.reg if slot.kind is SlotKind.REGISTER else None
         engine = ForwardSymbolicEngine(self.port, self.cache, self.registry)
         try:
-            return engine.resolve_at(func_ea, arg_index, target_ea, resolved_convention)
+            return engine.resolve_at(func_ea, arg_index, target_ea, initial_reg)
         except Exception:
             _logger.exception("Forward resolution failed for arg %d of %#x at %#x", arg_index, func_ea, target_ea)
             return unknown(UnknownReason.INTERNAL_ERROR)
