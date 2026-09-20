@@ -107,7 +107,6 @@ def test_tls_segment_operand_is_not_read_as_a_flat_address(port):
     assert "gs" in result.detail
 
 
-
 def test_plain_global_without_segment_override_still_reads_memory(port):
     port.set_memory(0x403000, (0xCAFEBABE).to_bytes(4, "little"))
     port.add_instructions([insn(0x401000, "mov", 6, [reg(0, EAX), mem_direct(1, 0x403000)])])
@@ -317,7 +316,6 @@ def test_push_sequence_stops_at_stack_pointer_write(port):
 
 
 # -- operand width normalization -------------------------------------------------------
-
 def test_lea_with_a_negative_displacement_folds_correctly(port):
     # Displacements arrive from IDA sign-extended to 64 bits; without
     # normalizing them `lea eax, [ebx-4]` folded to base + 2**64 - 4.
@@ -347,7 +345,6 @@ def test_add_of_a_negative_immediate_wraps_to_the_register_width(port):
 
 
 # -- memory shapes that name no single static address ----------------------------------
-
 def test_indexed_write_elsewhere_does_not_shadow_a_stack_argument(port):
     # `mov [ebx+ecx*4], 0x99` writes into a table through ebx. It used to
     # decode as `[esp+0]` (IDA reports the ModRM SIB marker, not the base),
@@ -398,7 +395,6 @@ def test_indexed_source_operand_is_not_flattened_to_its_base(port):
 
 
 # -- values used inside a loop ---------------------------------------------------------
-
 def test_register_set_before_a_loop_resolves_at_a_use_inside_it(port):
     # The back edge into the loop header used to come back as
     # Unknown(BUDGET_EXCEEDED), and `join` is absorbing on Unknown, so it
@@ -444,7 +440,6 @@ def test_stack_slot_written_before_a_loop_resolves_inside_it(port):
 
 
 # -- partial writes and call clobbering ------------------------------------------------
-
 def test_partial_register_write_is_not_reported_as_the_whole_register(port):
     # `mov al, 0x5A` gets its own register number on x86, so the walk used
     # to step straight past it and report the older full-width value.
@@ -508,3 +503,15 @@ def test_callee_saved_register_still_resolves_across_a_call(port):
     linear_block(port)
     result = make_resolver(port).resolve_register(ESI, 0x40100A)
     assert isinstance(result, Concrete) and result.value == 0x404000
+
+
+def test_xor_register_with_itself_folds_to_zero(port):
+    port.add_instructions(
+        [
+            insn(0x401000, "mov", 5, [reg(0, EAX), imm(1, 0x1234)]),
+            insn(0x401005, "xor", 2, [reg(0, EAX), reg(1, EAX)], read=(True, True)),
+        ]
+    )
+    linear_block(port)
+    result = make_resolver(port).resolve_register(EAX, 0x401007)
+    assert isinstance(result, Concrete) and result.value == 0

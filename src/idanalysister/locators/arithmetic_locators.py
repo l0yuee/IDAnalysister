@@ -106,6 +106,40 @@ class AddSubRegImmLocator(Locator):
         return state
 
 
+class ZeroIdiomLocator(Locator):
+    """`xor reg, reg` / `sub reg, reg` — the standard way every compiler
+    materializes 0 (and therefore `NULL`), far more common in real code
+    than `mov reg, 0`.
+
+    This is a fold, not a guess: the result is 0 for every possible prior
+    value of the register, so it needs no backward recursion at all."""
+
+    name = "zero_idiom"
+
+    def matches(self, instr: Instruction) -> bool:
+        if instr.mnem not in ("xor", "sub"):
+            return False
+        dst, src = instr.operand(0), instr.operand(1)
+        return (
+            dst is not None
+            and src is not None
+            and dst.kind is OperandKind.REG
+            and src.kind is OperandKind.REG
+            and dst.reg == src.reg
+        )
+
+    def extract(self, instr: Instruction, dest_operand: int, ctx: ResolutionContext) -> LocatorOutcome:
+        return LocatorOutcome.resolved(Concrete(0, ValueKind.INT))
+
+    def apply_forward(self, instr: Instruction, state: AbstractState) -> AbstractState:
+        state.set_register(instr.operand(0).reg, Concrete(0, ValueKind.INT))
+        return state
+
+
 def register_builtins(registry: LocatorRegistry) -> None:
     registry.register(LeaRegDisplLocator())
     registry.register(AddSubRegImmLocator())
+    # Higher priority than AddSubRegImmLocator so `sub reg, reg` is folded
+    # to 0 rather than falling through to the immediate-operand form (which
+    # would not match it anyway, but the ordering states the intent).
+    registry.register(ZeroIdiomLocator(), priority=1)

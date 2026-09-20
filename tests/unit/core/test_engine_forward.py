@@ -108,7 +108,6 @@ def test_stack_passed_argument_forward_tracking_is_unsupported_not_guessed(port6
 
 
 # -- regressions: the central memory path used to hijack other shapes ------------------
-
 def simulate(port, instructions, func_ea=0x401000, end_ea=0x401100, seed=None):
     """Run one straight-line block and return the resulting state."""
     port.add_instructions(instructions)
@@ -231,7 +230,6 @@ def test_call_clobbers_caller_saved_registers_and_names_its_return_value(port):
     assert isinstance(out.get_register(ECX), Unknown)
     assert out.get_register(ESI) == Concrete(7, out.get_register(ESI).kind)
     assert out.get_register(EAX) == Symbolic("ret(0x40100a)")
-
 
 
 def test_unconverged_fixpoint_reports_budget_exceeded_rather_than_a_value(port64):

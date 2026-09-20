@@ -534,7 +534,6 @@ extending the framework or debugging its behavior.
   `Unknown(UNSUPPORTED_OPERAND_SHAPE)`: the first names a whole family of
   addresses, the second an offset into a segment whose base the database
   does not know.
-
 - **`locators.immediate_locators`** — `mov [mem],imm`.
 - **`locators.stack_locators`** — `push` (any operand shape),
   `mov [mem],reg`.

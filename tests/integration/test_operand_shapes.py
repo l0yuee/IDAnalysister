@@ -108,7 +108,6 @@ def test_lea_with_negative_displacement_folds_to_the_right_address(probe_functio
     assert isinstance(value, Concrete) and value.value == expected
 
 
-
 def test_argument_at_a_call_site_inside_a_loop_resolves(probe_functions):
     extractor = ParamExtractor()
     report = extractor.extract_calls(probe_functions["target_func"], convention=CDECL, num_args=1)
@@ -116,7 +115,6 @@ def test_argument_at_a_call_site_inside_a_loop_resolves(probe_functions):
     assert len(sites) == 1
     value = sites[0].argument(0).raw_value
     assert isinstance(value, Concrete), f"expected the pre-loop value to survive the back edge, got {value!r}"
-
 
 
 def test_partial_register_write_is_reported_as_unknown_not_stale(probe_functions):

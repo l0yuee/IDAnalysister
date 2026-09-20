@@ -153,15 +153,19 @@ class ParamExtractor:
         slots = convention.slots(num_args, self.port)
         needs_pushes = any(slot.kind is SlotKind.STACK_PUSH for slot in slots)
         pushes = self.resolver.collect_push_sequence(call_ea) if needs_pushes else []
-        hexrays_args = None
-        if self._hexrays is not None:
-            hexrays_args = self._hexrays.resolve_call_args(call_ea, num_args)
+        # Resolved lazily: decompiling a function is expensive, so it only
+        # happens if the raw walk actually left an argument unresolved.
+        hexrays_args: dict | None = None
+        hexrays_tried = False
         arguments = []
         for slot in slots:
             raw = self._resolve_slot(call_ea, slot, pushes)
             source = "raw"
-            if not raw.is_known and hexrays_args is not None:
-                fallback_value = hexrays_args.get(slot.index)
+            if not raw.is_known and self._hexrays is not None:
+                if not hexrays_tried:
+                    hexrays_args = self._hexrays.resolve_call_args(call_ea, num_args)
+                    hexrays_tried = True
+                fallback_value = hexrays_args.get(slot.index) if hexrays_args else None
                 if fallback_value is not None and fallback_value.is_known:
                     raw = fallback_value
                     source = "hexrays_fallback"
