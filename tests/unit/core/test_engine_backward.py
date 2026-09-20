@@ -8,7 +8,22 @@ from idanalysister.core.insn_cache import InstructionCache
 from idanalysister.core.values import Concrete, MemoryRef, Symbolic, Unknown
 from idanalysister.locators.base import default_registry
 
-from ..conftest import EAX, EBX, ECX, EDX, ESI, ESP, imm, insn, mem_direct, mem_displ, mem_phrase, reg
+from ..conftest import (
+    EAX,
+    EBP,
+    EBX,
+    ECX,
+    EDX,
+    ESI,
+    ESP,
+    imm,
+    insn,
+    mem_direct,
+    mem_displ,
+    mem_index,
+    mem_phrase,
+    reg,
+)
 
 FUNC = 0x401000
 END = 0x401100
@@ -285,3 +300,33 @@ def test_push_sequence_stops_at_stack_pointer_write(port):
     resolver = make_resolver(port)
     pushes = resolver.collect_push_sequence(0x401009)
     assert pushes == []
+
+
+# -- operand width normalization -------------------------------------------------------
+
+def test_lea_with_a_negative_displacement_folds_correctly(port):
+    # Displacements arrive from IDA sign-extended to 64 bits; without
+    # normalizing them `lea eax, [ebx-4]` folded to base + 2**64 - 4.
+    port.add_instructions(
+        [
+            insn(0x401000, "mov", 5, [reg(0, EBX), imm(1, 0x404004)]),
+            insn(0x401005, "lea", 3, [reg(0, EAX), mem_displ(1, EBX, -4)]),
+        ]
+    )
+    linear_block(port)
+    result = make_resolver(port).resolve_register(EAX, 0x401008)
+    assert isinstance(result, Concrete) and result.value == 0x404000
+
+
+def test_add_of_a_negative_immediate_wraps_to_the_register_width(port):
+    # `add ebx, -8` encodes the immediate as 0xFFFFFFF8; folding without
+    # wrapping would land 2**32 away from the right answer.
+    port.add_instructions(
+        [
+            insn(0x401000, "mov", 5, [reg(0, EBX), imm(1, 0x404000)]),
+            insn(0x401005, "add", 3, [reg(0, EBX), imm(1, 0xFFFFFFF8)], read=(True, True)),
+        ]
+    )
+    linear_block(port)
+    result = make_resolver(port).resolve_register(EBX, 0x401008)
+    assert isinstance(result, Concrete) and result.value == 0x403FF8

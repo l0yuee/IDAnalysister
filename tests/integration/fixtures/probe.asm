@@ -77,7 +77,33 @@ caller_tail_call:
     push 0x77
     jmp target_func
 
+; Indexed (SIB) addressing. IDA reports the ModRM "SIB follows" marker in
+; the operand's register field rather than the real base, so `[ebx+ecx*4]`
+; decodes as `[esp+0]` unless the SIB byte is read — which made this
+; unrelated table write shadow the stack argument written just above it.
+caller_sib_shadow:
+    sub esp, 0x10
+    mov dword [esp], 0x5678
+    mov ebx, buffer
+    mov ecx, 1
+    mov dword [ebx+ecx*4], 0x99
+    call target_func
+    add esp, 0x10
+    ret
+
+; Negative displacement (IDA widens it to a sign-extended 64-bit ea_t even
+; in a 32-bit database) and an 8-bit partial write to a tracked register.
+caller_neg_disp:
+    mov ebx, buffer
+    lea eax, [ebx-4]
+    push eax
+    call target_func
+    add esp, 4
+    ret
+
 _start:
+    call caller_sib_shadow
+    call caller_neg_disp
     call caller_push_seq
     call caller_reg_indirect
     call caller_return_chain

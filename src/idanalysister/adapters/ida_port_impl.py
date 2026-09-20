@@ -14,6 +14,12 @@ from __future__ import annotations
 import functools
 from typing import Callable, TypeVar
 
+from idanalysister.adapters.ida_operand_decode import (
+    memory_operand_addressing,
+    rex_bits,
+    sign_extend,
+    unsigned_of_width,
+)
 from idanalysister.adapters.ida_port import IdaPort
 from idanalysister.core.ida_types import ArgLocation, BasicBlockInfo, FunctionPrototype
 from idanalysister.core.insn_model import Instruction, Operand, OperandKind
@@ -213,7 +219,11 @@ class IdaPortImpl(IdaPort):
             return None
 
         cc_name = _calling_convention_name(details.get_cc())
-        is_variadic = bool(details.get_cc() & ida_typeinf.CM_CC_ELLIPSIS)
+        # CM_CC_ELLIPSIS is one enumerated value of the CM_CC_MASK field
+        # (0x40 within 0xF0), not a standalone flag bit — testing it with
+        # `&` would also report stdcall (0x50), pascal (0x60), fastcall
+        # (0x70) and golang (0xB0) as variadic.
+        is_variadic = (details.get_cc() & ida_typeinf.CM_CC_MASK) == ida_typeinf.CM_CC_ELLIPSIS
 
         locations = []
         for index in range(len(details)):
@@ -350,16 +360,28 @@ def _convert_instruction(insn) -> Instruction:
         ida_idp.CF_CHG7,
         ida_idp.CF_CHG8,
     )
+    use_bits = (
+        ida_idp.CF_USE1,
+        ida_idp.CF_USE2,
+        ida_idp.CF_USE3,
+        ida_idp.CF_USE4,
+        ida_idp.CF_USE5,
+        ida_idp.CF_USE6,
+        ida_idp.CF_USE7,
+        ida_idp.CF_USE8,
+    )
     feature = insn.get_canon_feature()
 
     operands = []
     written = []
+    read = []
     for number in range(8):
         op = insn.ops[number]
         if op.type == ida_ua.o_void:
             continue
         operands.append(_convert_operand(insn, op, number))
         written.append(bool(feature & chg_bits[number]))
+        read.append(bool(feature & use_bits[number]))
 
     mnem = insn.get_canon_mnem() or ""
     is_control_transfer = bool(feature & (ida_idp.CF_CALL | ida_idp.CF_JUMP | ida_idp.CF_STOP))
@@ -370,6 +392,7 @@ def _convert_instruction(insn) -> Instruction:
         size=insn.size,
         operands=tuple(operands),
         operand_written=tuple(written),
+        operand_read=tuple(read),
         is_control_transfer=is_control_transfer,
     )
 
@@ -387,7 +410,10 @@ def _convert_operand(insn, op, number: int) -> Operand:
         return Operand(
             kind=OperandKind.IMMEDIATE,
             number=number,
-            imm_value=op.value,
+            # IDA widens every immediate to a sign-extended 64-bit uval_t;
+            # narrow it back to what the operand actually holds, so a 32-bit
+            # `push -4` reads as 0xFFFFFFFC rather than 0xFFFFFFFFFFFFFFFC.
+            imm_value=unsigned_of_width(op.value, dtype_size),
             dtype_size=dtype_size,
         )
 
@@ -401,22 +427,25 @@ def _convert_operand(insn, op, number: int) -> Operand:
             segment_name=segment_name,
         )
 
-    if op.type == ida_ua.o_phrase:
-        return Operand(
-            kind=OperandKind.MEM_PHRASE,
-            number=number,
-            reg=op.reg,
-            dtype_size=dtype_size,
-            segment_reg=segment_reg,
-            segment_name=segment_name,
+    if op.type in (ida_ua.o_phrase, ida_ua.o_displ):
+        # `op.reg`/`op.phrase` is NOT the base register when a SIB byte is
+        # present — see `adapters.ida_operand_decode` for what it actually
+        # holds and why taking it at face value silently turns
+        # `[ebx+ecx*4]` into a stack-pointer-relative access.
+        base_reg, index_reg, scale = memory_operand_addressing(
+            op.reg,
+            bool(op.specflag1),
+            op.specflag2,
+            rex_bits(getattr(insn, "insnpref", 0)),
         )
-
-    if op.type == ida_ua.o_displ:
+        is_displ = op.type == ida_ua.o_displ
         return Operand(
-            kind=OperandKind.MEM_DISPL,
+            kind=OperandKind.MEM_DISPL if is_displ else OperandKind.MEM_PHRASE,
             number=number,
-            reg=op.reg,
-            disp=op.addr,
+            reg=base_reg,
+            index_reg=index_reg,
+            scale=scale,
+            disp=sign_extend(op.addr) if is_displ else 0,
             dtype_size=dtype_size,
             segment_reg=segment_reg,
             segment_name=segment_name,

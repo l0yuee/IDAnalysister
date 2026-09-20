@@ -45,6 +45,15 @@ def _build_probe_binary() -> Path:
     obj_path = FIXTURES_DIR / "probe.o"
     subprocess.run(["nasm", "-f", "elf32", str(ASM_SOURCE), "-o", str(obj_path)], check=True)
     subprocess.run(["ld", "-m", "elf_i386", "-o", str(BINARY_PATH), str(obj_path)], check=True)
+    # A database left over from a previous build would be reopened as-is,
+    # silently testing the *old* binary — every function would still be
+    # found by name and every assertion would run against stale analysis.
+    for stale in FIXTURES_DIR.glob("probe.i*"):
+        stale.unlink()
+    for suffix in (".id0", ".id1", ".id2", ".nam", ".til"):
+        leftover = FIXTURES_DIR / f"probe{suffix}"
+        if leftover.exists():
+            leftover.unlink()
     return BINARY_PATH
 
 
@@ -81,6 +90,8 @@ def probe_functions(ida_session):
         "caller_return_chain",
         "decrypt_then_call",
         "caller_tail_call",
+        "caller_sib_shadow",
+        "caller_neg_disp",
     ]
     result = {}
     for name in names:

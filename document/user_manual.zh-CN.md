@@ -444,6 +444,7 @@ port.add_instruction(
         ea=0x401000, mnem="my_mnemonic", itype=1, size=3,
         operands=(Operand(kind=OperandKind.REG, number=0, reg=0, dtype_size=4),),
         operand_written=(True,),
+        operand_read=(False,),   # CF_USE 位：读改写操作数才置 True
     )
 )
 port.set_function(0x401000, 0x401100, blocks=(BasicBlockInfo(0x401000, 0x401100, (), ()),))

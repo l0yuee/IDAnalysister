@@ -81,6 +81,8 @@ architecture-agnostic view built once by `ida_port_impl._convert_instruction`
 from `ida_ua.insn_t`/`op_t`. Beyond the obvious fields (mnemonic, operand
 kind/register/displacement/immediate), each operand carries a parallel
 `operand_written: tuple[bool, ...]` computed from IDA's own `CF_CHG1..CF_CHG8`
+(and `operand_read`, from `CF_USE1..CF_USE8`, which is what distinguishes a
+plain assignment from a read-modify-write such as `add [ebp-8], eax`)
 instruction-feature bits (`ida_idp`). This is what lets the resolver
 recognize "this instruction defines register/memory operand N" **generically,
 for any instruction — including ones with no dedicated `Locator`** — rather
@@ -202,6 +204,15 @@ a bounded worklist fixpoint over the CFG:
   visits, any location whose value hasn't stabilized is widened straight
   to `Unknown(LOOP_NON_CONVERGENT)` — since `Unknown` is absorbing under
   `join`, this guarantees termination.
+
+Note this only holds because the adapter reconstructs the operand
+faithfully first. IDA reports the ModRM "a SIB byte follows" marker in an
+operand's register field rather than the real base, so `[ecx+edx]` decodes
+as `[esp+0]` unless the SIB byte is read — which made a decryption loop's
+writes look like writes to the caller's stack frame. See
+`adapters.ida_operand_decode` for that reconstruction and for the operand
+width normalization (IDA widens displacements and immediates to a
+sign-extended 64-bit value regardless of the database's bitness).
 
 **The canonical scenario this is built for**: a decryption loop that
 mutates a buffer through `[ptr_reg + loop_counter]` — a *non-constant*
