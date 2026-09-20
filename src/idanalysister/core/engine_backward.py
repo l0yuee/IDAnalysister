@@ -79,6 +79,27 @@ class _NotFound:
 _NOT_FOUND = _NotFound()
 
 
+class _CycleClosed:
+    """Sentinel for a backward path that looped back to a block already on
+    the current path.
+
+    Such a path carries *no information*: every block along it has already
+    been scanned for a definition by the time the cycle is detected (the
+    visited check fires only after the block's own instructions are
+    walked), so reaching the start again just means "this way in comes from
+    inside the loop". Treating it as `Unknown` instead would poison the
+    join with the genuinely informative predecessors — which is why a value
+    set before a loop and used inside it used to resolve to nothing."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - cosmetic
+        return "<cycle>"
+
+
+_CYCLE = _CycleClosed()
+
+
 @dataclass
 class ResolutionBudget:
     """Per-top-level-query bound shared across every recursive callback a
@@ -183,7 +204,10 @@ class BackwardResolver:
         block = cfg.block_containing(before_ea) if not cfg.is_empty() else None
         if block is None:
             return self._walk_register_linear(reg, before_ea, func_ea)
-        return self._walk_register_block(reg, before_ea, block, func_ea, cfg, frozenset())
+        result = self._walk_register_block(reg, before_ea, block, func_ea, cfg, frozenset())
+        if result is _CYCLE:
+            return unknown(UnknownReason.NO_DEFINITION_FOUND, detail="every path into this block loops back")
+        return result
 
     def _walk_register_linear(self, reg: int, boundary_ea: int, func_ea: int) -> ValueLattice:
         ea = self.port.prev_head(boundary_ea, func_ea)
@@ -218,7 +242,7 @@ class BackwardResolver:
                     return result
             ea = self.port.prev_head(ea, block.start_ea)
         if block.start_ea in visited_blocks:
-            return unknown(UnknownReason.BUDGET_EXCEEDED, detail="cyclic backward path")
+            return _CYCLE
         preds = cfg.predecessors(block)
         if not preds:
             return unknown(UnknownReason.NO_DEFINITION_FOUND)
@@ -228,15 +252,69 @@ class BackwardResolver:
         results = [
             self._walk_register_block(reg, pred.end_ea, pred, func_ea, cfg, next_visited) for pred in preds
         ]
-        return join_all(results)
+        # Drop cycle-closing paths before joining: they contribute nothing,
+        # and `join` is absorbing on `Unknown`, so leaving them in would
+        # discard whatever the real predecessors proved.
+        informative = [r for r in results if r is not _CYCLE]
+        if not informative:
+            return _CYCLE
+        return join_all(informative)
 
     def _match_register_definition(self, instr: Instruction, reg: int, func_ea: int) -> ValueLattice | None:
+        if instr.mnem.startswith("call"):
+            # A call both defines the return register (requirement 3.1
+            # form #8) and destroys every other caller-saved one. Carrying
+            # a value backward past a call through a volatile register
+            # would report what the caller set up before the call as if the
+            # callee had left it alone.
+            if reg == self.port.return_value_reg():
+                return self._interpret_definition(instr, 0, func_ea)
+            if self._is_call_clobbered(reg):
+                return unknown(
+                    UnknownReason.NO_DEFINITION_FOUND,
+                    detail=f"caller-saved register is destroyed by the call at {instr.ea:#x}",
+                )
+        query = self.port.register_view(reg)
         for op in instr.operands:
-            if op.kind is OperandKind.REG and op.reg == reg and instr.is_written(op.number):
+            if op.kind is not OperandKind.REG or not instr.is_written(op.number):
+                continue
+            write = self.port.register_view(op.reg, op.dtype_size)
+            if query is None or write is None:
+                # No register-layout information: fall back to raw number
+                # identity, which is what this used to do unconditionally.
+                if op.reg == reg:
+                    return self._interpret_definition(instr, op.number, func_ea)
+                continue
+            if write.parent != query.parent:
+                continue
+            if write.write_defines_parent or (
+                write.bit_offset == 0 and write.bit_size >= query.bit_size
+            ):
                 return self._interpret_definition(instr, op.number, func_ea)
-        if instr.mnem.startswith("call") and reg == self.port.return_value_reg():
-            return self._interpret_definition(instr, 0, func_ea)
+            # A partial write (`mov al, 5` into a tracked `eax`) leaves the
+            # rest of the register holding an older value. Walking past it
+            # would report that older value as if it were the whole
+            # register — the exact shape of guess this framework exists to
+            # avoid — and folding the two halves together is beyond a
+            # value-level dataflow walk.
+            return unknown(
+                UnknownReason.UNSUPPORTED_OPERAND_SHAPE,
+                detail=(
+                    f"{instr.mnem} at {instr.ea:#x} writes only bits "
+                    f"[{write.bit_offset}, {write.bit_offset + write.bit_size}) "
+                    f"of the tracked register"
+                ),
+            )
         return None
+
+    def _is_call_clobbered(self, reg: int) -> bool:
+        clobbered = self.port.call_clobbered_registers()
+        if not clobbered:
+            return False
+        if reg in clobbered:
+            return True
+        view = self.port.register_view(reg)
+        return view is not None and view.parent in clobbered
 
     # -- memory resolution --------------------------------------------------------------
     def _resolve_memory_impl(self, base_reg: int | None, disp: int, before_ea: int, size: int) -> ValueLattice:
@@ -252,6 +330,10 @@ class BackwardResolver:
                 found = self._walk_memory_linear(query_key, before_ea, func_ea)
             else:
                 found = self._walk_memory_block(query_key, before_ea, block, func_ea, cfg, frozenset())
+            if found is _CYCLE:
+                # No write found anywhere reachable — same outcome as never
+                # having found one.
+                found = _NOT_FOUND
         if found is not _NOT_FOUND:
             return found
         return self._fallback_dereference(base_reg, disp, before_ea, size)
@@ -289,7 +371,7 @@ class BackwardResolver:
                     return result
             ea = self.port.prev_head(ea, block.start_ea)
         if block.start_ea in visited_blocks:
-            return _NOT_FOUND
+            return _CYCLE
         preds = cfg.predecessors(block)
         if not preds:
             return _NOT_FOUND
@@ -299,10 +381,16 @@ class BackwardResolver:
         results = [
             self._walk_memory_block(query_key, pred.end_ea, pred, func_ea, cfg, next_visited) for pred in preds
         ]
-        found = [r for r in results if r is not _NOT_FOUND]
+        # A cycle-closing path is not evidence that the location is
+        # undefined on that path — it is no evidence at all, so it must not
+        # count towards "defined on some paths but not others".
+        informative = [r for r in results if r is not _CYCLE]
+        if not informative:
+            return _CYCLE
+        found = [r for r in informative if r is not _NOT_FOUND]
         if not found:
             return _NOT_FOUND
-        if len(found) != len(results):
+        if len(found) != len(informative):
             return unknown(
                 UnknownReason.DIVERGENT_PATHS,
                 detail="memory location defined on some incoming paths but not others",
@@ -310,33 +398,68 @@ class BackwardResolver:
         return join_all(found)
 
     def _match_memory_definition(self, instr: Instruction, query_key: tuple, func_ea: int) -> ValueLattice | None:
+        query_space, _query_offset = query_key
         for op in instr.operands:
             if not op.is_memory or not instr.is_written(op.number):
                 continue
             if op.kind is OperandKind.MEM_DIRECT:
-                key = self._normalize_memory_key(None, op.addr, instr.ea, func_ea)
+                space, offset = self._memory_location(None, op.addr, instr.ea, func_ea)
             elif op.reg is not None:
-                key = self._normalize_memory_key(op.reg, op.disp, instr.ea, func_ea)
+                space, offset = self._memory_location(op.reg, op.disp, instr.ea, func_ea)
             else:
                 continue
-            if key != query_key:
+            if op.segment_name:
+                # A write through fs:/gs: has no statically known linear
+                # address, so it gets its own space: it can neither satisfy
+                # nor shadow a default-segment query.
+                space = (op.segment_name,) + space
+            if op.has_index:
+                # A runtime index means this write lands on *some* cell of
+                # `space` that we cannot pin down. If the query lives in
+                # the same space, the write may well be the one that
+                # defined it — walking past it to an older write would be
+                # exactly the kind of guess this framework must not make.
+                # A different space falls under the same no-aliasing
+                # approximation that `(base, disp)` identity matching
+                # already documents.
+                if space == query_space:
+                    return unknown(
+                        UnknownReason.UNSUPPORTED_OPERAND_SHAPE,
+                        detail=f"indexed write at {instr.ea:#x} may alias the queried location",
+                    )
+                continue
+            if (space, offset) != query_key:
                 continue
             return self._interpret_definition(instr, op.number, func_ea)
         return None
 
-    def _normalize_memory_key(self, base_reg: int | None, disp: int, ea: int, func_ea: int) -> tuple:
+    def _memory_location(self, base_reg: int | None, disp: int, ea: int, func_ea: int) -> tuple[tuple, int]:
+        """Split a memory reference into `(space, offset)`: which region it
+        is relative to, and which cell within that region.
+
+        Two references name the same cell only if both halves match. The
+        split matters because an *indexed* reference has a known space but
+        an unknown offset, which is what lets `_match_memory_definition`
+        tell "may alias the query" apart from "provably a different
+        region"."""
         if base_reg is None:
-            return ("abs", disp)
+            return ("abs",), disp
         sp_reg = self.port.stack_pointer_reg()
         if sp_reg is not None and base_reg == sp_reg:
             delta = self.port.get_sp_delta(func_ea, ea)
             if delta is None:
-                return ("sp-unknown", base_reg, disp, ea)
-            return ("sp", delta + disp)
+                # Without a stack delta this reference cannot be compared
+                # with any other; give it a space of its own keyed by its
+                # own address so it matches nothing, including itself.
+                return ("sp-unknown", ea), disp
+            return ("sp",), delta + disp
         fp_reg = self.port.frame_pointer_reg()
         if fp_reg is not None and base_reg == fp_reg:
-            return ("fp", disp)
-        return ("reg", base_reg, disp)
+            return ("fp",), disp
+        return ("reg", base_reg), disp
+
+    def _normalize_memory_key(self, base_reg: int | None, disp: int, ea: int, func_ea: int) -> tuple:
+        return self._memory_location(base_reg, disp, ea, func_ea)
 
     def _fallback_dereference(self, base_reg: int | None, disp: int, before_ea: int, size: int) -> ValueLattice:
         if base_reg is None:

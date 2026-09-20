@@ -81,6 +81,8 @@ architecture-agnostic view built once by `ida_port_impl._convert_instruction`
 from `ida_ua.insn_t`/`op_t`. Beyond the obvious fields (mnemonic, operand
 kind/register/displacement/immediate), each operand carries a parallel
 `operand_written: tuple[bool, ...]` computed from IDA's own `CF_CHG1..CF_CHG8`
+(and `operand_read`, from `CF_USE1..CF_USE8`, which is what distinguishes a
+plain assignment from a read-modify-write such as `add [ebp-8], eax`)
 instruction-feature bits (`ida_idp`). This is what lets the resolver
 recognize "this instruction defines register/memory operand N" **generically,
 for any instruction — including ones with no dedicated `Locator`** — rather
@@ -125,7 +127,7 @@ Built-in locators, one small module per family:
 |---|---|
 | `register_locators.py` | `mov reg,reg` / `mov reg,imm` / `lea reg,[global]` / `xchg` / `cmov` |
 | `arithmetic_locators.py` | `lea reg,[base+disp]` / `add`,`sub reg,imm` (constant folding) |
-| `memory_locators.py` | `mov reg,[mem]` — global, `[reg+off]`, TLS (`gs:`/`fs:`) |
+| `memory_locators.py` | `mov reg,[mem]` — global, `[reg+off]` |
 | `immediate_locators.py` | `mov [mem],imm` |
 | `stack_locators.py` | `push` (any operand shape) / `mov [mem],reg` |
 | `call_return_locators.py` | prior call's return register used as an argument |
@@ -167,7 +169,11 @@ work without a `Locator` needing to special-case call semantics itself.
   displacements are used directly (stable across the function), and
   arbitrary-register-relative accesses are matched by literal `(reg, disp)`
   identity — a documented approximation (no general pointer-aliasing
-  analysis). It searches backward for the nearest matching write; only if
+  analysis). A reference is split into a *space* (which region it is
+  relative to) and an *offset* within it, so an indexed write
+  (`mov [esp+eax*4], edx`) — which has a known space but an unknowable
+  offset — can be reported as possibly aliasing the query instead of
+  being either ignored or flattened to offset zero. It searches backward for the nearest matching write; only if
   none is found does it fall back to reading the IDB's static byte content
   (correct for true globals; for stack/heap-relative queries with no local
   write, the honest answer is `Unknown(NO_DEFINITION_FOUND)`, since raw
@@ -202,6 +208,15 @@ a bounded worklist fixpoint over the CFG:
   visits, any location whose value hasn't stabilized is widened straight
   to `Unknown(LOOP_NON_CONVERGENT)` — since `Unknown` is absorbing under
   `join`, this guarantees termination.
+
+Note this only holds because the adapter reconstructs the operand
+faithfully first. IDA reports the ModRM "a SIB byte follows" marker in an
+operand's register field rather than the real base, so `[ecx+edx]` decodes
+as `[esp+0]` unless the SIB byte is read — which made a decryption loop's
+writes look like writes to the caller's stack frame. See
+`adapters.ida_operand_decode` for that reconstruction and for the operand
+width normalization (IDA widens displacements and immediates to a
+sign-extended 64-bit value regardless of the database's bitness).
 
 **The canonical scenario this is built for**: a decryption loop that
 mutates a buffer through `[ptr_reg + loop_counter]` — a *non-constant*

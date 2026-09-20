@@ -57,7 +57,7 @@ mutated what it points to.
   memory-indirect (always dereferenced to the real value, never just the
   address), stack push sequences (correct right-to-left ordering),
   stack writes via `mov`, register-indirect/struct-field addressing,
-  global and TLS access, and a prior call's return value used as an
+  global access, and a prior call's return value used as an
   argument — plus `xchg`/`cmov`/`movsx`/`movzx`/`lea`/`add`/`sub` handled
   out of the box, and any other form addable without touching core code.
 - **Calling-convention handling** three ways: built-in templates (cdecl,
@@ -76,8 +76,15 @@ mutated what it points to.
 - **An honest "I don't know"**: every unresolved value is a typed `Unknown`
   with a specific, inspectable reason (budget exceeded, divergent control
   flow paths, unsupported instruction, memory read failed, ...) — the
-  framework never fabricates a value and never raises an exception out of
-  its public API.
+  framework never fabricates a value, and no *analysis* failure ever
+  raises out of its public API. (Calling it wrongly still raises: asking
+  for a template convention without `num_args` when IDA has no prototype
+  is a `ConventionError`, because that is a bug in the call, not an
+  unresolvable program.) Shapes with no single statically-knowable answer
+  — an indexed `[base+index*scale]` access, an `fs:`/`gs:` TLS offset
+  whose segment base isn't in the database, an 8- or 16-bit write into a
+  register being tracked at full width — are reported as `Unknown` with
+  the specific reason, never flattened into a plausible-looking number.
 - **Optional Hex-Rays cross-check**: if a licensed decompiler is available,
   it can be used as a secondary fallback for values the raw engine leaves
   unknown — opt-in, never the default, and every result is tagged with

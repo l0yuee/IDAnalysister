@@ -18,6 +18,7 @@ from idanalysister.core.diagnostics import UnknownReason
 from idanalysister.core.insn_model import Instruction, OperandKind
 from idanalysister.core.state import AbstractState
 from idanalysister.core.values import Concrete, ValueKind, unknown
+from idanalysister.locators._common import wrap_to_width
 from idanalysister.locators.base import Locator, LocatorOutcome, LocatorRegistry, ResolutionContext
 
 
@@ -40,15 +41,20 @@ class LeaRegDisplLocator(Locator):
             and dst.kind is OperandKind.REG
             and src.kind in (OperandKind.MEM_DISPL, OperandKind.MEM_PHRASE)
             and src.reg is not None
+            # `lea eax, [ebx+ecx*4]` depends on a runtime index; folding it
+            # as `ebx+0` would fabricate a pointer to the wrong element.
+            and not src.has_index
         )
 
     def extract(self, instr: Instruction, dest_operand: int, ctx: ResolutionContext) -> LocatorOutcome:
-        src = instr.operand(1)
+        dst, src = instr.operand(0), instr.operand(1)
         base = ctx.resolve_register(src.reg, instr.ea)
         base_int = _int_of(base)
         if base_int is None:
             return LocatorOutcome.resolved(base if not base.is_known else unknown(UnknownReason.UNSUPPORTED_OPERAND_SHAPE))
-        return LocatorOutcome.resolved(Concrete(base_int + src.disp, ValueKind.POINTER))
+        return LocatorOutcome.resolved(
+            Concrete(wrap_to_width(base_int + src.disp, dst.dtype_size), ValueKind.POINTER)
+        )
 
     def apply_forward(self, instr: Instruction, state: AbstractState) -> AbstractState:
         dst, src = instr.operand(0), instr.operand(1)
@@ -60,7 +66,9 @@ class LeaRegDisplLocator(Locator):
         if base_int is None:
             state.set_register(dst.reg, base if not base.is_known else unknown(UnknownReason.UNSUPPORTED_OPERAND_SHAPE))
             return state
-        state.set_register(dst.reg, Concrete(base_int + src.disp, ValueKind.POINTER))
+        state.set_register(
+            dst.reg, Concrete(wrap_to_width(base_int + src.disp, dst.dtype_size), ValueKind.POINTER)
+        )
         return state
 
 
@@ -82,7 +90,9 @@ class AddSubRegImmLocator(Locator):
         if prior_int is None:
             return LocatorOutcome.resolved(prior)
         delta = src.imm_value if instr.mnem == "add" else -src.imm_value
-        return LocatorOutcome.resolved(Concrete(prior_int + delta, ValueKind.INT))
+        return LocatorOutcome.resolved(
+            Concrete(wrap_to_width(prior_int + delta, dst.dtype_size), ValueKind.INT)
+        )
 
     def apply_forward(self, instr: Instruction, state: AbstractState) -> AbstractState:
         dst, src = instr.operand(0), instr.operand(1)
@@ -92,10 +102,44 @@ class AddSubRegImmLocator(Locator):
             state.set_register(dst.reg, prior if not prior.is_known else unknown(UnknownReason.UNSUPPORTED_OPERAND_SHAPE))
             return state
         delta = src.imm_value if instr.mnem == "add" else -src.imm_value
-        state.set_register(dst.reg, Concrete(prior_int + delta, ValueKind.INT))
+        state.set_register(dst.reg, Concrete(wrap_to_width(prior_int + delta, dst.dtype_size), ValueKind.INT))
+        return state
+
+
+class ZeroIdiomLocator(Locator):
+    """`xor reg, reg` / `sub reg, reg` — the standard way every compiler
+    materializes 0 (and therefore `NULL`), far more common in real code
+    than `mov reg, 0`.
+
+    This is a fold, not a guess: the result is 0 for every possible prior
+    value of the register, so it needs no backward recursion at all."""
+
+    name = "zero_idiom"
+
+    def matches(self, instr: Instruction) -> bool:
+        if instr.mnem not in ("xor", "sub"):
+            return False
+        dst, src = instr.operand(0), instr.operand(1)
+        return (
+            dst is not None
+            and src is not None
+            and dst.kind is OperandKind.REG
+            and src.kind is OperandKind.REG
+            and dst.reg == src.reg
+        )
+
+    def extract(self, instr: Instruction, dest_operand: int, ctx: ResolutionContext) -> LocatorOutcome:
+        return LocatorOutcome.resolved(Concrete(0, ValueKind.INT))
+
+    def apply_forward(self, instr: Instruction, state: AbstractState) -> AbstractState:
+        state.set_register(instr.operand(0).reg, Concrete(0, ValueKind.INT))
         return state
 
 
 def register_builtins(registry: LocatorRegistry) -> None:
     registry.register(LeaRegDisplLocator())
     registry.register(AddSubRegImmLocator())
+    # Higher priority than AddSubRegImmLocator so `sub reg, reg` is folded
+    # to 0 rather than falling through to the immediate-operand form (which
+    # would not match it anyway, but the ordering states the intent).
+    registry.register(ZeroIdiomLocator(), priority=1)

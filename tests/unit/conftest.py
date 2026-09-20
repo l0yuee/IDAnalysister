@@ -60,14 +60,39 @@ def mem_phrase(number, base_reg, size=4):
     return Operand(kind=OperandKind.MEM_PHRASE, number=number, reg=base_reg, disp=0, dtype_size=size)
 
 
-def insn(ea, mnem, size, operands, written=None, itype=1, is_control_transfer=None):
+def mem_index(number, base_reg, index_reg, scale=4, disp=0, size=4):
+    """`[base + index*scale + disp]` — the indexed addressing form whose
+    index used to be silently dropped by the adapter."""
+    return Operand(
+        kind=OperandKind.MEM_DISPL if disp else OperandKind.MEM_PHRASE,
+        number=number,
+        reg=base_reg,
+        index_reg=index_reg,
+        scale=scale,
+        disp=disp,
+        dtype_size=size,
+    )
+
+
+def insn(ea, mnem, size, operands, written=None, read=None, itype=1, is_control_transfer=None):
     """`written` defaults to True for operand 0 only (the common case),
-    False elsewhere — pass an explicit tuple to override. `is_control_transfer`
-    defaults to True for call/jmp/j<cc>/ret mnemonics (mirroring IDA's own
-    CF_CALL|CF_JUMP|CF_STOP feature bits) and False otherwise — pass an
-    explicit bool to override."""
+    False elsewhere — pass an explicit tuple to override.
+
+    `read` mirrors IDA's `CF_USE1..CF_USE8` and defaults to the `mov`-like
+    shape: every operand is read except a written operand 0. Instructions
+    that update their destination in place (`add eax, 4`, `add [ebp-8],
+    ecx`) must pass it explicitly as `read=(True, True)` — the engines use
+    written-and-not-read to tell a plain assignment apart from a
+    read-modify-write, and defaulting it wrong here would hide exactly the
+    bug that distinction exists to prevent.
+
+    `is_control_transfer` defaults to True for call/jmp/j<cc>/ret mnemonics
+    (mirroring IDA's own CF_CALL|CF_JUMP|CF_STOP feature bits) and False
+    otherwise — pass an explicit bool to override."""
     if written is None:
         written = tuple(i == 0 for i in range(len(operands)))
+    if read is None:
+        read = tuple(not (i == 0 and written[i]) for i in range(len(operands)))
     if is_control_transfer is None:
         is_control_transfer = mnem.startswith(("call", "jmp", "j", "ret"))
     return Instruction(
@@ -77,5 +102,6 @@ def insn(ea, mnem, size, operands, written=None, itype=1, is_control_transfer=No
         size=size,
         operands=tuple(operands),
         operand_written=written,
+        operand_read=read,
         is_control_transfer=is_control_transfer,
     )

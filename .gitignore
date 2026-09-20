@@ -21,7 +21,8 @@ env/
 *.swo
 .DS_Store
 
-# IDA Pro databases and generated artifacts
+# IDA Pro databases and generated artifacts (matches regardless of the
+# analyzed binary's basename, e.g. "whatever.exe.i64", "sample.idb", ...)
 *.idb
 *.i64
 *.id0
@@ -32,7 +33,22 @@ env/
 *.asm.gen
 *.dmp
 
-# Integration test fixture build artifacts (rebuilt on demand from .asm)
+# Ad-hoc analysis targets: binaries dropped into the project directory (or
+# opened from it in IDA) while debugging against a real sample are not part
+# of this project's source and must never be committed. Extension-based
+# rules can't catch an extensionless sample, so prefer dropping such files
+# under /samples/ (fully ignored below, any name/extension) instead of the
+# repo root.
+*.exe
+*.dll
+*.sys
+*.bin
+*.obj
+/samples/
+
+# Integration test fixture build artifacts (rebuilt on demand from .asm) —
+# tests/integration/fixtures/*.asm sources ARE part of this project and stay
+# tracked; only their compiled output is ignored.
 tests/integration/fixtures/probe
 tests/integration/fixtures/*.o
 

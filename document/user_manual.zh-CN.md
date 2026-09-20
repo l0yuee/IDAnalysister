@@ -355,11 +355,11 @@ if not arg.raw_value.is_known:
 
 | `UnknownReason` | 含义 | 该怎么办 |
 |---|---|---|
-| `NO_DEFINITION_FOUND` | 一直回溯到函数入口（或正向分析的起点）都没有找到写入该位置的指令。 | 通常意味着这个值确实来自更上层的调用链，或者函数依赖调用者已经预先设置好的寄存器——在很多情况下这是符合预期的。 |
+| `NO_DEFINITION_FOUND` | 一直回溯到函数入口（或正向分析的起点）都没有找到写入该位置的指令；或者回溯过程中跨越了一条 `call`，而被追踪的是调用者保存（volatile）寄存器，被调用方可以随意破坏它。 | 通常意味着这个值确实来自更上层的调用链，或者函数依赖调用者已经预先设置好的寄存器——在很多情况下这是符合预期的。若 `detail` 中提到了某条 call，说明该值是在这条调用之前写入某个 volatile 寄存器的，并不是被调用方返回后的实际内容。 |
 | `DIVERGENT_PATHS` / `DIVERGENT_SYMBOLIC` | 两条控制流路径上的值互相矛盾。 | 这不是 bug——框架拒绝猜测。可以考虑改用 `resolve_argument_at`，把 `target_ea` 定在你关心的那一条具体路径上。 |
 | `BUDGET_EXCEEDED` | 触发了步数/基本块数量上限。 | 调高 `max_steps`/`max_blocks`（见 §3.10）。 |
 | `UNSUPPORTED_INSTRUCTION` | 没有任何 `Locator` 认得这条指令是一个"定义点"。 | 添加一个——见 §3.7。 |
-| `UNSUPPORTED_OPERAND_SHAPE` | 某个定位器匹配上了助记符，但操作数的具体组合不匹配（或者某个参数槽位根本无法被解析为寄存器/偏移量）。 | 常见原因是调用约定不匹配——先检查 `convention`/`num_args` 是否正确；否则需要扩展相应的定位器。 |
+| `UNSUPPORTED_OPERAND_SHAPE` | 某个定位器匹配上了助记符，但操作数的具体组合不匹配；某个参数槽位根本无法被解析为寄存器/偏移量；操作数带变址（`[base+index*scale]`）或是 `fs:`/`gs:` 段相对寻址，因而不对应唯一的静态地址；某次写入只覆盖了被追踪寄存器的一部分（对 `eax` 追踪时遇到 `mov al, 5`）；或者某个带变址的写入可能与被查询的位置重叠。 | 先看 `detail`，它会给出具体指令与具体原因。最常见的仍是调用约定不匹配，先检查 `convention`/`num_args`；否则需要扩展相应的定位器。 |
 | `MEMORY_READ_FAILED` | 计算出的地址在 IDB 中没有数据。 | 对于没有本地写入定义的栈/堆地址,或者确实未映射的区域，这是预期行为。 |
 | `INDIRECT_CONTROL_FLOW` | 预留给间接调用/跳转导致静态确定性被打破的情形。 | 仅供参考。 |
 | `LOOP_NON_CONVERGENT` | 一个被正向跟踪的值在循环的多次迭代中持续变化，未能收敛。 | 说明该值在那个位置确实不是一个单一常量。 |
@@ -394,7 +394,7 @@ if not arg.raw_value.is_known:
 - **`locators.base`** —— `Locator`（接口）、`LocatorRegistry`、`ResolutionContext`（`extract()` 接收到的上下文对象）、`default_registry()`（构建一个包含全部内置定位器的注册表）。
 - **`locators.register_locators`** —— `mov reg,reg`/`mov reg,imm`/`lea reg,[global]`/`xchg`/`cmov`。
 - **`locators.arithmetic_locators`** —— `lea reg,[base+disp]`/`add`、`sub reg,imm`（常量折叠，反向与正向均支持）。
-- **`locators.memory_locators`** —— `mov reg,[mem]` 的各种寻址形态（全局变量、`[reg+off]`、TLS）。
+- **`locators.memory_locators`** —— `mov reg,[mem]` 中能确定唯一静态地址的各种寻址形态（全局变量、`[reg+off]`）。带变址的 `[base+index*scale]` 与 `fs:`/`gs:` 段相对操作数会解析为 `Unknown(UNSUPPORTED_OPERAND_SHAPE)`：前者对应的是一族地址而非单个单元，后者的段基址在数据库中无从得知。
 - **`locators.immediate_locators`** —— `mov [mem],imm`。
 - **`locators.stack_locators`** —— `push`（任意操作数形态）、`mov [mem],reg`。
 - **`locators.call_return_locators`** —— 前一次调用的返回寄存器被用作参数。
@@ -444,6 +444,7 @@ port.add_instruction(
         ea=0x401000, mnem="my_mnemonic", itype=1, size=3,
         operands=(Operand(kind=OperandKind.REG, number=0, reg=0, dtype_size=4),),
         operand_written=(True,),
+        operand_read=(False,),   # CF_USE 位：读改写操作数才置 True
     )
 )
 port.set_function(0x401000, 0x401100, blocks=(BasicBlockInfo(0x401000, 0x401100, (), ()),))

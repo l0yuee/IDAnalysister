@@ -8,7 +8,22 @@ from idanalysister.core.insn_cache import InstructionCache
 from idanalysister.core.values import Concrete, MemoryRef, Symbolic, Unknown
 from idanalysister.locators.base import default_registry
 
-from ..conftest import EAX, EBX, ECX, EDX, ESI, ESP, imm, insn, mem_direct, mem_displ, mem_phrase, reg
+from ..conftest import (
+    EAX,
+    EBP,
+    EBX,
+    ECX,
+    EDX,
+    ESI,
+    ESP,
+    imm,
+    insn,
+    mem_direct,
+    mem_displ,
+    mem_index,
+    mem_phrase,
+    reg,
+)
 
 FUNC = 0x401000
 END = 0x401100
@@ -79,9 +94,22 @@ def test_register_indirect_write_then_read(port):
 
 
 # -- form #7: TLS / global passing ------------------------------------------------------
-def test_tls_style_segment_operand_reads_configured_memory(port):
+def test_tls_segment_operand_is_not_read_as_a_flat_address(port):
+    # `mov eax, gs:[0x30]` names offset 0x30 *within the TLS segment*,
+    # whose base is not statically known. Reading linear address 0x30
+    # instead would silently report whatever unrelated data happens to
+    # live there, so the honest answer is a reasoned Unknown.
     port.set_memory(0x30, (0xCAFEBABE).to_bytes(4, "little"))
     port.add_instructions([insn(0x401000, "mov", 6, [reg(0, EAX), mem_direct(1, 0x30, segment_name="gs")])])
+    linear_block(port)
+    result = make_resolver(port).resolve_register(EAX, 0x401006)
+    assert isinstance(result, Unknown) and result.reason is UnknownReason.UNSUPPORTED_OPERAND_SHAPE
+    assert "gs" in result.detail
+
+
+def test_plain_global_without_segment_override_still_reads_memory(port):
+    port.set_memory(0x403000, (0xCAFEBABE).to_bytes(4, "little"))
+    port.add_instructions([insn(0x401000, "mov", 6, [reg(0, EAX), mem_direct(1, 0x403000)])])
     linear_block(port)
     result = make_resolver(port).resolve_register(EAX, 0x401006)
     assert isinstance(result, MemoryRef) and result.value.value == 0xCAFEBABE
@@ -285,3 +313,205 @@ def test_push_sequence_stops_at_stack_pointer_write(port):
     resolver = make_resolver(port)
     pushes = resolver.collect_push_sequence(0x401009)
     assert pushes == []
+
+
+# -- operand width normalization -------------------------------------------------------
+def test_lea_with_a_negative_displacement_folds_correctly(port):
+    # Displacements arrive from IDA sign-extended to 64 bits; without
+    # normalizing them `lea eax, [ebx-4]` folded to base + 2**64 - 4.
+    port.add_instructions(
+        [
+            insn(0x401000, "mov", 5, [reg(0, EBX), imm(1, 0x404004)]),
+            insn(0x401005, "lea", 3, [reg(0, EAX), mem_displ(1, EBX, -4)]),
+        ]
+    )
+    linear_block(port)
+    result = make_resolver(port).resolve_register(EAX, 0x401008)
+    assert isinstance(result, Concrete) and result.value == 0x404000
+
+
+def test_add_of_a_negative_immediate_wraps_to_the_register_width(port):
+    # `add ebx, -8` encodes the immediate as 0xFFFFFFF8; folding without
+    # wrapping would land 2**32 away from the right answer.
+    port.add_instructions(
+        [
+            insn(0x401000, "mov", 5, [reg(0, EBX), imm(1, 0x404000)]),
+            insn(0x401005, "add", 3, [reg(0, EBX), imm(1, 0xFFFFFFF8)], read=(True, True)),
+        ]
+    )
+    linear_block(port)
+    result = make_resolver(port).resolve_register(EBX, 0x401008)
+    assert isinstance(result, Concrete) and result.value == 0x403FF8
+
+
+# -- memory shapes that name no single static address ----------------------------------
+def test_indexed_write_elsewhere_does_not_shadow_a_stack_argument(port):
+    # `mov [ebx+ecx*4], 0x99` writes into a table through ebx. It used to
+    # decode as `[esp+0]` (IDA reports the ModRM SIB marker, not the base),
+    # so it shadowed the real argument written by `mov [esp], 0x1234` and
+    # the call site reported 0x99.
+    port.add_instructions(
+        [
+            insn(0x401000, "mov", 7, [mem_displ(0, ESP, 0), imm(1, 0x1234)]),
+            insn(0x401007, "mov", 7, [mem_index(0, EBX, ECX, scale=4), imm(1, 0x99)]),
+            insn(0x40100E, "call", 5, [mem_direct(0, 0x402000)], written=(False,)),
+        ]
+    )
+    linear_block(port)
+    for ea in (0x401000, 0x401007, 0x40100E):
+        port.set_sp_delta(FUNC, ea, 0)
+    result = make_resolver(port).resolve_memory(ESP, 0, 0x40100E, 4)
+    assert isinstance(result, Concrete) and result.value == 0x1234
+
+
+def test_indexed_write_in_the_same_region_is_reported_as_possible_aliasing(port):
+    # `mov [esp+ecx*4], 0x99` really might land on [esp+0]; reporting the
+    # older write would be a guess.
+    port.add_instructions(
+        [
+            insn(0x401000, "mov", 7, [mem_displ(0, ESP, 0), imm(1, 0x1234)]),
+            insn(0x401007, "mov", 7, [mem_index(0, ESP, ECX, scale=4), imm(1, 0x99)]),
+        ]
+    )
+    linear_block(port)
+    for ea in (0x401000, 0x401007, 0x40100E):
+        port.set_sp_delta(FUNC, ea, 0)
+    result = make_resolver(port).resolve_memory(ESP, 0, 0x40100E, 4)
+    assert isinstance(result, Unknown) and result.reason is UnknownReason.UNSUPPORTED_OPERAND_SHAPE
+    assert "alias" in result.detail
+
+
+def test_indexed_source_operand_is_not_flattened_to_its_base(port):
+    port.set_memory(0x404000, (0xDEAD).to_bytes(4, "little"))
+    port.add_instructions(
+        [
+            insn(0x401000, "mov", 5, [reg(0, EBX), imm(1, 0x404000)]),
+            insn(0x401005, "mov", 3, [reg(0, EAX), mem_index(1, EBX, ECX, scale=4)]),
+        ]
+    )
+    linear_block(port)
+    result = make_resolver(port).resolve_register(EAX, 0x401008)
+    assert isinstance(result, Unknown) and result.reason is UnknownReason.UNSUPPORTED_OPERAND_SHAPE
+
+
+# -- values used inside a loop ---------------------------------------------------------
+def test_register_set_before_a_loop_resolves_at_a_use_inside_it(port):
+    # The back edge into the loop header used to come back as
+    # Unknown(BUDGET_EXCEEDED), and `join` is absorbing on Unknown, so it
+    # poisoned the one predecessor that actually proved the value. Every
+    # call site inside a loop was affected.
+    port.add_instructions(
+        [
+            insn(0x401000, "mov", 5, [reg(0, ESI), imm(1, 0x404000)]),
+            insn(0x401005, "push", 1, [reg(0, ESI)], written=(False,)),
+            insn(0x401006, "jmp", 2, [mem_direct(0, 0x401005)], written=(False,)),
+        ]
+    )
+    port.set_function(
+        FUNC,
+        END,
+        blocks=(
+            BasicBlockInfo(0x401000, 0x401005, succ_starts=(0x401005,), pred_starts=()),
+            BasicBlockInfo(0x401005, END, succ_starts=(0x401005,), pred_starts=(0x401000, 0x401005)),
+        ),
+    )
+    result = make_resolver(port).resolve_register(ESI, 0x401005)
+    assert isinstance(result, Concrete) and result.value == 0x404000
+
+
+def test_stack_slot_written_before_a_loop_resolves_inside_it(port):
+    port.add_instructions(
+        [
+            insn(0x401000, "mov", 5, [mem_displ(0, EBP, -8), imm(1, 0x777)]),
+            insn(0x401005, "mov", 3, [reg(0, EAX), mem_displ(1, EBP, -8)]),
+            insn(0x401008, "jmp", 2, [mem_direct(0, 0x401005)], written=(False,)),
+        ]
+    )
+    port.set_function(
+        FUNC,
+        END,
+        blocks=(
+            BasicBlockInfo(0x401000, 0x401005, succ_starts=(0x401005,), pred_starts=()),
+            BasicBlockInfo(0x401005, END, succ_starts=(0x401005,), pred_starts=(0x401000, 0x401005)),
+        ),
+    )
+    result = make_resolver(port).resolve_register(EAX, 0x401005 + 3)
+    assert isinstance(result, Concrete) and result.value == 0x777
+
+
+# -- partial writes and call clobbering ------------------------------------------------
+def test_partial_register_write_is_not_reported_as_the_whole_register(port):
+    # `mov al, 0x5A` gets its own register number on x86, so the walk used
+    # to step straight past it and report the older full-width value.
+    al = port.register_by_name("al")
+    port.add_instructions(
+        [
+            insn(0x401000, "mov", 5, [reg(0, EAX), imm(1, 0x11223344)]),
+            insn(0x401005, "mov", 2, [reg(0, al, size=1), imm(1, 0x5A, size=1)]),
+        ]
+    )
+    linear_block(port)
+    result = make_resolver(port).resolve_register(EAX, 0x401007)
+    assert isinstance(result, Unknown) and result.reason is UnknownReason.UNSUPPORTED_OPERAND_SHAPE
+    assert "bits [0, 8)" in result.detail
+
+
+def test_sixteen_bit_write_sharing_the_parent_number_is_also_partial(port):
+    port.add_instructions(
+        [
+            insn(0x401000, "mov", 5, [reg(0, EAX), imm(1, 0x11223344)]),
+            insn(0x401005, "mov", 4, [reg(0, EAX, size=2), imm(1, 0x99, size=2)]),
+        ]
+    )
+    linear_block(port)
+    result = make_resolver(port).resolve_register(EAX, 0x401009)
+    assert isinstance(result, Unknown) and result.reason is UnknownReason.UNSUPPORTED_OPERAND_SHAPE
+
+
+def test_thirty_two_bit_write_fully_defines_a_sixty_four_bit_register(port64):
+    # x86-64 zeroes the upper half on any 32-bit destination, so
+    # `mov ecx, 0x1234` really does define the whole of rcx. Without this
+    # rule almost every x86-64 argument setup would report Unknown.
+    port64.add_instructions([insn(0x401000, "mov", 5, [reg(0, ECX, size=4), imm(1, 0x1234)])])
+    port64.set_function(FUNC, END, blocks=(BasicBlockInfo(FUNC, END, (), ()),))
+    result = make_resolver(port64).resolve_register(ECX, 0x401005)
+    assert isinstance(result, Concrete) and result.value == 0x1234
+
+
+def test_caller_saved_register_is_not_carried_back_across_a_call(port):
+    # ecx is volatile under every x86 convention: whatever `foo` did to it
+    # is unknowable, so the value set before the call must not be reported.
+    port.add_instructions(
+        [
+            insn(0x401000, "mov", 5, [reg(0, ECX), imm(1, 5)]),
+            insn(0x401005, "call", 5, [mem_direct(0, 0x402000)], written=(False,)),
+        ]
+    )
+    linear_block(port)
+    result = make_resolver(port).resolve_register(ECX, 0x40100A)
+    assert isinstance(result, Unknown) and result.reason is UnknownReason.NO_DEFINITION_FOUND
+    assert "call" in result.detail
+
+
+def test_callee_saved_register_still_resolves_across_a_call(port):
+    port.add_instructions(
+        [
+            insn(0x401000, "mov", 5, [reg(0, ESI), imm(1, 0x404000)]),
+            insn(0x401005, "call", 5, [mem_direct(0, 0x402000)], written=(False,)),
+        ]
+    )
+    linear_block(port)
+    result = make_resolver(port).resolve_register(ESI, 0x40100A)
+    assert isinstance(result, Concrete) and result.value == 0x404000
+
+
+def test_xor_register_with_itself_folds_to_zero(port):
+    port.add_instructions(
+        [
+            insn(0x401000, "mov", 5, [reg(0, EAX), imm(1, 0x1234)]),
+            insn(0x401005, "xor", 2, [reg(0, EAX), reg(1, EAX)], read=(True, True)),
+        ]
+    )
+    linear_block(port)
+    result = make_resolver(port).resolve_register(EAX, 0x401007)
+    assert isinstance(result, Concrete) and result.value == 0

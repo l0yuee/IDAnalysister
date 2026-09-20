@@ -40,3 +40,35 @@ class FunctionPrototype:
     calling_convention: str  # "cdecl" | "stdcall" | "fastcall" | "thiscall" | "ms_x64" | "sysv_x64" | "unknown"
     arg_locations: tuple[ArgLocation, ...]
     is_variadic: bool = False
+
+
+@dataclass(frozen=True)
+class RegisterView:
+    """One addressable *view* of a processor register.
+
+    x86 register numbering is not one-number-per-register: `al`/`ah` get
+    their own numbers (16/20 on x86) while `ax`/`eax`/`rax` all share
+    number 0 and are told apart only by the operand's decoded size. Both
+    shapes break naive "does this instruction write register N" matching —
+    the first makes a write to `al` invisible as a write to `eax`, the
+    second makes a write to `ax` look like a full write to `eax`.
+
+    `parent` is the widest register this view belongs to, so views can be
+    compared for identity, and `bit_offset`/`bit_size` say which part of it
+    this view actually covers.
+    """
+
+    parent: int
+    bit_offset: int
+    bit_size: int
+    parent_bit_size: int
+    #: Whether *writing* this view leaves the whole parent register with a
+    #: statically known value: either the view is the entire parent, or the
+    #: ISA defines the rest to be cleared (x86-64 zeroes the upper 32 bits
+    #: on any 32-bit-operand write). Only the adapter knows this rule, so it
+    #: is decided there rather than re-derived in the analysis core.
+    write_defines_parent: bool = False
+
+    @property
+    def is_whole_parent(self) -> bool:
+        return self.bit_offset == 0 and self.bit_size >= self.parent_bit_size
