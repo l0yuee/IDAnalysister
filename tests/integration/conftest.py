@@ -93,6 +93,7 @@ def probe_functions(ida_session):
         "caller_sib_shadow",
         "caller_in_loop",
         "caller_neg_disp",
+        "caller_partial_reg",
     ]
     result = {}
     for name in names:

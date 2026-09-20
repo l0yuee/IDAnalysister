@@ -114,10 +114,19 @@ caller_neg_disp:
     add esp, 4
     ret
 
+caller_partial_reg:
+    mov eax, 0x11223344
+    mov al, 0x5A
+    push eax
+    call target_func
+    add esp, 4
+    ret
+
 _start:
     call caller_sib_shadow
     call caller_in_loop
     call caller_neg_disp
+    call caller_partial_reg
     call caller_push_seq
     call caller_reg_indirect
     call caller_return_chain

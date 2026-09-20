@@ -116,3 +116,15 @@ def test_argument_at_a_call_site_inside_a_loop_resolves(probe_functions):
     assert len(sites) == 1
     value = sites[0].argument(0).raw_value
     assert isinstance(value, Concrete), f"expected the pre-loop value to survive the back edge, got {value!r}"
+
+
+
+def test_partial_register_write_is_reported_as_unknown_not_stale(probe_functions):
+    # `mov eax, 0x11223344; mov al, 0x5A; push eax` — 0x11223344 is not the
+    # value passed, and neither is 0x5A.
+    extractor = ParamExtractor()
+    report = extractor.extract_calls(probe_functions["target_func"], convention=CDECL, num_args=1)
+    sites = _sites_in(report, extractor.port, probe_functions["caller_partial_reg"])
+    assert len(sites) == 1
+    value = sites[0].argument(0).raw_value
+    assert isinstance(value, Unknown) and value.reason is UnknownReason.UNSUPPORTED_OPERAND_SHAPE

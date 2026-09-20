@@ -208,6 +208,32 @@ def test_indexed_write_through_another_register_leaves_the_stack_model_alone(por
     assert out.get_register(ESI) == Symbolic("arg0")
 
 
+def test_partial_register_write_invalidates_the_parent(port):
+    out = simulate(
+        port,
+        [
+            insn(0x401000, "mov", 5, [reg(0, EAX), imm(1, 0x11223344)]),
+            insn(0x401005, "mov", 4, [reg(0, EAX, size=2), imm(1, 0x99, size=2)]),
+        ],
+    )
+    assert isinstance(out.get_register(EAX), Unknown)
+
+
+def test_call_clobbers_caller_saved_registers_and_names_its_return_value(port):
+    out = simulate(
+        port,
+        [
+            insn(0x401000, "mov", 5, [reg(0, ECX), imm(1, 5)]),
+            insn(0x401005, "mov", 5, [reg(0, ESI), imm(1, 7)]),
+            insn(0x40100A, "call", 5, [mem_direct(0, 0x402000)], written=(False,)),
+        ],
+    )
+    assert isinstance(out.get_register(ECX), Unknown)
+    assert out.get_register(ESI) == Concrete(7, out.get_register(ESI).kind)
+    assert out.get_register(EAX) == Symbolic("ret(0x40100a)")
+
+
+
 def test_unconverged_fixpoint_reports_budget_exceeded_rather_than_a_value(port64):
     insns = [
         insn(0x500000, "mov", 5, [reg(0, RDX, 8), reg(1, RCX, 8)]),

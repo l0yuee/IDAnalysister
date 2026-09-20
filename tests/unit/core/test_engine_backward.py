@@ -441,3 +441,70 @@ def test_stack_slot_written_before_a_loop_resolves_inside_it(port):
     )
     result = make_resolver(port).resolve_register(EAX, 0x401005 + 3)
     assert isinstance(result, Concrete) and result.value == 0x777
+
+
+# -- partial writes and call clobbering ------------------------------------------------
+
+def test_partial_register_write_is_not_reported_as_the_whole_register(port):
+    # `mov al, 0x5A` gets its own register number on x86, so the walk used
+    # to step straight past it and report the older full-width value.
+    al = port.register_by_name("al")
+    port.add_instructions(
+        [
+            insn(0x401000, "mov", 5, [reg(0, EAX), imm(1, 0x11223344)]),
+            insn(0x401005, "mov", 2, [reg(0, al, size=1), imm(1, 0x5A, size=1)]),
+        ]
+    )
+    linear_block(port)
+    result = make_resolver(port).resolve_register(EAX, 0x401007)
+    assert isinstance(result, Unknown) and result.reason is UnknownReason.UNSUPPORTED_OPERAND_SHAPE
+    assert "bits [0, 8)" in result.detail
+
+
+def test_sixteen_bit_write_sharing_the_parent_number_is_also_partial(port):
+    port.add_instructions(
+        [
+            insn(0x401000, "mov", 5, [reg(0, EAX), imm(1, 0x11223344)]),
+            insn(0x401005, "mov", 4, [reg(0, EAX, size=2), imm(1, 0x99, size=2)]),
+        ]
+    )
+    linear_block(port)
+    result = make_resolver(port).resolve_register(EAX, 0x401009)
+    assert isinstance(result, Unknown) and result.reason is UnknownReason.UNSUPPORTED_OPERAND_SHAPE
+
+
+def test_thirty_two_bit_write_fully_defines_a_sixty_four_bit_register(port64):
+    # x86-64 zeroes the upper half on any 32-bit destination, so
+    # `mov ecx, 0x1234` really does define the whole of rcx. Without this
+    # rule almost every x86-64 argument setup would report Unknown.
+    port64.add_instructions([insn(0x401000, "mov", 5, [reg(0, ECX, size=4), imm(1, 0x1234)])])
+    port64.set_function(FUNC, END, blocks=(BasicBlockInfo(FUNC, END, (), ()),))
+    result = make_resolver(port64).resolve_register(ECX, 0x401005)
+    assert isinstance(result, Concrete) and result.value == 0x1234
+
+
+def test_caller_saved_register_is_not_carried_back_across_a_call(port):
+    # ecx is volatile under every x86 convention: whatever `foo` did to it
+    # is unknowable, so the value set before the call must not be reported.
+    port.add_instructions(
+        [
+            insn(0x401000, "mov", 5, [reg(0, ECX), imm(1, 5)]),
+            insn(0x401005, "call", 5, [mem_direct(0, 0x402000)], written=(False,)),
+        ]
+    )
+    linear_block(port)
+    result = make_resolver(port).resolve_register(ECX, 0x40100A)
+    assert isinstance(result, Unknown) and result.reason is UnknownReason.NO_DEFINITION_FOUND
+    assert "call" in result.detail
+
+
+def test_callee_saved_register_still_resolves_across_a_call(port):
+    port.add_instructions(
+        [
+            insn(0x401000, "mov", 5, [reg(0, ESI), imm(1, 0x404000)]),
+            insn(0x401005, "call", 5, [mem_direct(0, 0x402000)], written=(False,)),
+        ]
+    )
+    linear_block(port)
+    result = make_resolver(port).resolve_register(ESI, 0x40100A)
+    assert isinstance(result, Concrete) and result.value == 0x404000

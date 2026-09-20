@@ -21,7 +21,7 @@ from idanalysister.adapters.ida_operand_decode import (
     unsigned_of_width,
 )
 from idanalysister.adapters.ida_port import IdaPort
-from idanalysister.core.ida_types import ArgLocation, BasicBlockInfo, FunctionPrototype
+from idanalysister.core.ida_types import ArgLocation, BasicBlockInfo, FunctionPrototype, RegisterView
 from idanalysister.core.insn_model import Instruction, Operand, OperandKind
 from idanalysister.logging_ import get_logger
 
@@ -63,6 +63,13 @@ def _empty_tuple() -> tuple:
 class IdaPortImpl(IdaPort):
     """`IdaPort` implementation for use inside a running IDA / `idalib`
     session with a loaded database."""
+
+    def __init__(self) -> None:
+        # (reg, size) -> RegisterView | None. Register layout is fixed for
+        # the lifetime of a database, and `register_view` is consulted for
+        # every operand of every decoded instruction.
+        self._register_views: dict[tuple[int, int], RegisterView | None] = {}
+        self._call_clobbered: frozenset[int] | None = None
 
     # -- instruction decoding -------------------------------------------------
     @_safe(default=None)
@@ -305,6 +312,89 @@ class IdaPortImpl(IdaPort):
 
         reg = ida_idp.str2reg(name)
         return reg if reg >= 0 else None
+
+    @_safe(default=frozenset)
+    def call_clobbered_registers(self) -> frozenset[int]:
+        if self._call_clobbered is None:
+            if self.pointer_size() == 8:
+                # Volatile under both the Microsoft x64 and System V AMD64
+                # ABIs. rsi/rdi are deliberately absent: volatile on System
+                # V but callee-saved on Windows, and the database does not
+                # reliably say which applies.
+                names = ("rax", "rcx", "rdx", "r8", "r9", "r10", "r11")
+            else:
+                # Volatile under cdecl, stdcall, fastcall and thiscall
+                # alike; ebx/esi/edi/ebp are callee-saved in all four.
+                names = ("eax", "ecx", "edx")
+            regs = {self.register_by_name(name) for name in names}
+            self._call_clobbered = frozenset(r for r in regs if r is not None)
+        return self._call_clobbered
+
+    @_safe(default=None)
+    def register_view(self, reg: int, size_bytes: int = 0) -> RegisterView | None:
+        import ida_bitrange
+        import ida_idp
+
+        if (reg, size_bytes) in self._register_views:
+            return self._register_views[(reg, size_bytes)]
+
+        view = None
+        # `get_reg_name` needs the width to pick between ax/eax/rax, which
+        # all share one register number; an explicit operand size is used
+        # when we have one, otherwise the widest name that resolves wins.
+        widths = (size_bytes,) if size_bytes else (8, 4, 2, 1)
+        for width in widths:
+            name = ida_idp.get_reg_name(reg, width)
+            if not name:
+                continue
+            bitrange = ida_bitrange.bitrange_t()
+            parent_name = ida_idp.get_reg_info(name, bitrange)
+            if not parent_name:
+                # No sub-register relationship known: the register stands
+                # alone and the operand size is its full width.
+                bits = width * 8
+                view = RegisterView(reg, 0, bits, bits, write_defines_parent=True)
+                break
+            parent = ida_idp.str2reg(parent_name)
+            if parent is None or parent < 0:
+                break
+            parent_bits = self._register_bit_width(parent_name)
+            # A bitrange of (0, 0) is IDA's way of saying "the whole
+            # register", not "zero bits wide".
+            bit_size = bitrange.bitsize() or parent_bits
+            bit_offset = bitrange.bitoff()
+            whole = bit_offset == 0 and bit_size >= parent_bits
+            view = RegisterView(
+                parent=parent,
+                bit_offset=bit_offset,
+                bit_size=bit_size,
+                parent_bit_size=parent_bits,
+                write_defines_parent=whole or self._write_zero_extends(bit_offset, bit_size, parent_bits),
+            )
+            break
+
+        self._register_views[(reg, size_bytes)] = view
+        return view
+
+    @staticmethod
+    def _write_zero_extends(bit_offset: int, bit_size: int, parent_bits: int) -> bool:
+        """x86-64's rule: any instruction with a 32-bit destination operand
+        zeroes the upper 32 bits of the 64-bit register, so `mov ecx, 5`
+        *does* fully define `rcx`. Without this, virtually every x86-64
+        argument setup would be reported as a partial write."""
+        return bit_offset == 0 and bit_size == 32 and parent_bits == 64
+
+    @_safe(default=32)
+    def _register_bit_width(self, name: str) -> int:
+        import ida_idp
+
+        reg = ida_idp.str2reg(name)
+        if reg is None or reg < 0:
+            return self.pointer_size() * 8
+        for width in (8, 4, 2, 1):
+            if ida_idp.get_reg_name(reg, width) == name:
+                return width * 8
+        return self.pointer_size() * 8
 
     @_safe(default=None)
     def return_value_reg(self) -> int | None:

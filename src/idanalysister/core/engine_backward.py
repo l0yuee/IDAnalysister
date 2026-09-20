@@ -261,12 +261,60 @@ class BackwardResolver:
         return join_all(informative)
 
     def _match_register_definition(self, instr: Instruction, reg: int, func_ea: int) -> ValueLattice | None:
+        if instr.mnem.startswith("call"):
+            # A call both defines the return register (requirement 3.1
+            # form #8) and destroys every other caller-saved one. Carrying
+            # a value backward past a call through a volatile register
+            # would report what the caller set up before the call as if the
+            # callee had left it alone.
+            if reg == self.port.return_value_reg():
+                return self._interpret_definition(instr, 0, func_ea)
+            if self._is_call_clobbered(reg):
+                return unknown(
+                    UnknownReason.NO_DEFINITION_FOUND,
+                    detail=f"caller-saved register is destroyed by the call at {instr.ea:#x}",
+                )
+        query = self.port.register_view(reg)
         for op in instr.operands:
-            if op.kind is OperandKind.REG and op.reg == reg and instr.is_written(op.number):
+            if op.kind is not OperandKind.REG or not instr.is_written(op.number):
+                continue
+            write = self.port.register_view(op.reg, op.dtype_size)
+            if query is None or write is None:
+                # No register-layout information: fall back to raw number
+                # identity, which is what this used to do unconditionally.
+                if op.reg == reg:
+                    return self._interpret_definition(instr, op.number, func_ea)
+                continue
+            if write.parent != query.parent:
+                continue
+            if write.write_defines_parent or (
+                write.bit_offset == 0 and write.bit_size >= query.bit_size
+            ):
                 return self._interpret_definition(instr, op.number, func_ea)
-        if instr.mnem.startswith("call") and reg == self.port.return_value_reg():
-            return self._interpret_definition(instr, 0, func_ea)
+            # A partial write (`mov al, 5` into a tracked `eax`) leaves the
+            # rest of the register holding an older value. Walking past it
+            # would report that older value as if it were the whole
+            # register — the exact shape of guess this framework exists to
+            # avoid — and folding the two halves together is beyond a
+            # value-level dataflow walk.
+            return unknown(
+                UnknownReason.UNSUPPORTED_OPERAND_SHAPE,
+                detail=(
+                    f"{instr.mnem} at {instr.ea:#x} writes only bits "
+                    f"[{write.bit_offset}, {write.bit_offset + write.bit_size}) "
+                    f"of the tracked register"
+                ),
+            )
         return None
+
+    def _is_call_clobbered(self, reg: int) -> bool:
+        clobbered = self.port.call_clobbered_registers()
+        if not clobbered:
+            return False
+        if reg in clobbered:
+            return True
+        view = self.port.register_view(reg)
+        return view is not None and view.parent in clobbered
 
     # -- memory resolution --------------------------------------------------------------
     def _resolve_memory_impl(self, base_reg: int | None, disp: int, before_ea: int, size: int) -> ValueLattice:

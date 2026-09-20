@@ -82,9 +82,9 @@ mutated what it points to.
   is a `ConventionError`, because that is a bug in the call, not an
   unresolvable program.) Shapes with no single statically-knowable answer
   — an indexed `[base+index*scale]` access, an `fs:`/`gs:` TLS offset
-  whose segment base isn't in the database — are reported as `Unknown`
-  with the specific reason, never flattened into a plausible-looking
-  number.
+  whose segment base isn't in the database, an 8- or 16-bit write into a
+  register being tracked at full width — are reported as `Unknown` with
+  the specific reason, never flattened into a plausible-looking number.
 - **Optional Hex-Rays cross-check**: if a licensed decompiler is available,
   it can be used as a secondary fallback for values the raw engine leaves
   unknown — opt-in, never the default, and every result is tagged with

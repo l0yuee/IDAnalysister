@@ -216,6 +216,33 @@ class ForwardSymbolicEngine:
 
     # -- per-instruction transfer function -----------------------------------------------
     def _step(self, instr: Instruction, state: AbstractState, func_ea: int) -> AbstractState:
+        state = self._step_transfer(instr, state, func_ea)
+        return self._invalidate_partial_register_writes(instr, state)
+
+    def _invalidate_partial_register_writes(self, instr: Instruction, state: AbstractState) -> AbstractState:
+        """Undo any assignment made for a write that only covers part of a
+        register (`mov al, 5`, `mov ax, 5`).
+
+        Locators legitimately key state by the operand's own register
+        number, which for `ax`/`eax`/`rax` is the *same* number — so a
+        16-bit write would otherwise be recorded as a full-width one, and
+        an 8-bit write (its own number on x86) would leave a stale value
+        under the parent's number."""
+        for op in instr.operands:
+            if op.kind is not OperandKind.REG or not instr.is_written(op.number):
+                continue
+            view = self.port.register_view(op.reg, op.dtype_size)
+            if view is None or view.write_defines_parent:
+                continue
+            state.invalidate_register(view.parent, UnknownReason.UNSUPPORTED_OPERAND_SHAPE)
+            if op.reg != view.parent:
+                state.invalidate_register(op.reg, UnknownReason.UNSUPPORTED_OPERAND_SHAPE)
+        return state
+
+    def _step_transfer(self, instr: Instruction, state: AbstractState, func_ea: int) -> AbstractState:
+        if instr.mnem.startswith("call"):
+            return self._apply_call(instr, state)
+
         # A locator that defines real forward semantics gets first refusal,
         # *before* the central memory handling below looks at operand
         # shapes. `lea reg, [ebp-8]` is why: its source operand looks
@@ -245,6 +272,22 @@ class ForwardSymbolicEngine:
         if locator is not None:
             return self._apply_locator(locator, instr, state)
         return self._invalidate_written_registers(instr, state)
+
+    def _apply_call(self, instr: Instruction, state: AbstractState) -> AbstractState:
+        """A call leaves the return register holding the callee's result
+        and every other caller-saved register holding nothing knowable.
+
+        Handled here rather than in `CallReturnLocator.apply_forward`
+        because which registers a call destroys is a property of the
+        platform, which only `IdaPort` knows — the same reason the backward
+        resolver treats a call specially rather than pushing it into a
+        locator."""
+        for reg in self.port.call_clobbered_registers():
+            state.invalidate_register(reg, UnknownReason.INDIRECT_CONTROL_FLOW)
+        return_reg = self.port.return_value_reg()
+        if return_reg is not None:
+            state.set_register(return_reg, Symbolic(f"ret({instr.ea:#x})"))
+        return state
 
     def _apply_locator(self, locator, instr: Instruction, state: AbstractState) -> AbstractState:
         try:

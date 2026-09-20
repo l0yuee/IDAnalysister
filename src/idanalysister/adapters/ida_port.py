@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
-from idanalysister.core.ida_types import BasicBlockInfo, FunctionPrototype
+from idanalysister.core.ida_types import BasicBlockInfo, FunctionPrototype, RegisterView
 from idanalysister.core.insn_model import Instruction
 
 
@@ -111,6 +111,26 @@ class IdaPort(ABC):
     def register_by_name(self, name: str) -> int | None:
         """Processor register number for `name` (e.g. `"ecx"`, `"rdx"`),
         used by calling-convention templates to name registers portably."""
+
+    @abstractmethod
+    def call_clobbered_registers(self) -> frozenset[int]:
+        """Registers whose value is *not* preserved across a `call` under
+        every calling convention plausible for this database.
+
+        Deliberately the intersection, not the union: a register listed
+        here is unambiguously destroyed by any callee, so a backward walk
+        must not carry a value across a call through it. A register left
+        out is merely not *known* to be preserved — omitting it keeps the
+        previous (optimistic) behavior rather than inventing `Unknown`s
+        from an ABI guess. Empty tuple if the architecture is unknown."""
+
+    @abstractmethod
+    def register_view(self, reg: int, size_bytes: int = 0) -> RegisterView | None:
+        """Resolve `(register number, operand size)` to the part of a
+        canonical register it names — see `core.ida_types.RegisterView`.
+        `size_bytes` of 0 means "whatever width this register number
+        denotes on its own". Returns `None` if the register is unknown, in
+        which case callers must fall back to raw number comparison."""
 
     @abstractmethod
     def return_value_reg(self) -> int | None:

@@ -10,7 +10,7 @@ import anywhere in this module — that is the entire point.
 from __future__ import annotations
 
 from idanalysister.adapters.ida_port import IdaPort
-from idanalysister.core.ida_types import BasicBlockInfo, FunctionPrototype
+from idanalysister.core.ida_types import BasicBlockInfo, FunctionPrototype, RegisterView
 from idanalysister.core.insn_model import Instruction
 
 
@@ -20,18 +20,29 @@ class FakeIdaPort(IdaPort):
     #: internally consistent (matches neither real x86 nor x64 IDP register
     #: numbers) — tests refer to registers by name via `register_by_name`.
     DEFAULT_REGISTERS: dict[str, int] = {
-        "eax": 0, "ax": 0, "al": 0, "rax": 0,
-        "ecx": 1, "cx": 1, "cl": 1, "rcx": 1,
-        "edx": 2, "dx": 2, "dl": 2, "rdx": 2,
-        "ebx": 3, "bx": 3, "bl": 3, "rbx": 3,
+        "eax": 0, "ax": 0, "rax": 0,
+        "ecx": 1, "cx": 1, "rcx": 1,
+        "edx": 2, "dx": 2, "rdx": 2,
+        "ebx": 3, "bx": 3, "rbx": 3,
         "esp": 4, "sp": 4, "rsp": 4,
         "ebp": 5, "bp": 5, "rbp": 5,
         "esi": 6, "si": 6, "rsi": 6,
         "edi": 7, "di": 7, "rdi": 7,
         "r8": 8, "r8d": 8,
         "r9": 9, "r9d": 9,
+        # 8-bit views carry their own register numbers, exactly as on real
+        # x86 (al=16..bl=19, ah=20..bh=23) — the whole point is that a
+        # write to `al` does *not* look like a write to `eax` by number.
+        "al": 16, "cl": 17, "dl": 18, "bl": 19,
+        "ah": 20, "ch": 21, "dh": 22, "bh": 23,
         "gs": 100,
         "fs": 101,
+    }
+
+    #: Register numbers of the 8-bit views, mapped to (parent, bit offset).
+    SUB_REGISTERS: dict[int, tuple[int, int]] = {
+        16: (0, 0), 17: (1, 0), 18: (2, 0), 19: (3, 0),
+        20: (0, 8), 21: (1, 8), 22: (2, 8), 23: (3, 8),
     }
 
     def __init__(self, *, pointer_size: int = 8, registers: dict[str, int] | None = None):
@@ -175,6 +186,34 @@ class FakeIdaPort(IdaPort):
 
     def register_by_name(self, name: str) -> int | None:
         return self._registers.get(name.lower())
+
+    def call_clobbered_registers(self) -> frozenset[int]:
+        names = ("rax", "rcx", "rdx", "r8", "r9") if self._pointer_size == 8 else ("eax", "ecx", "edx")
+        return frozenset(r for r in (self._registers.get(n) for n in names) if r is not None)
+
+    def register_view(self, reg: int, size_bytes: int = 0) -> RegisterView | None:
+        parent_bits = self._pointer_size * 8
+        if reg in self.SUB_REGISTERS:
+            parent, bit_offset = self.SUB_REGISTERS[reg]
+            return RegisterView(
+                parent=parent,
+                bit_offset=bit_offset,
+                bit_size=8,
+                parent_bit_size=parent_bits,
+                write_defines_parent=False,
+            )
+        if reg not in self._registers.values():
+            return None
+        bit_size = size_bytes * 8 if size_bytes else parent_bits
+        whole = bit_size >= parent_bits
+        zero_extends = bit_size == 32 and parent_bits == 64
+        return RegisterView(
+            parent=reg,
+            bit_offset=0,
+            bit_size=bit_size,
+            parent_bit_size=parent_bits,
+            write_defines_parent=whole or zero_extends,
+        )
 
     def return_value_reg(self) -> int | None:
         return self._registers.get("rax" if self._pointer_size == 8 else "eax")
