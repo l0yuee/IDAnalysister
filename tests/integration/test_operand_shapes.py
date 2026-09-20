@@ -106,3 +106,13 @@ def test_lea_with_negative_displacement_folds_to_the_right_address(probe_functio
     value = sites[0].argument(0).raw_value
     expected = ida_name.get_name_ea(0, "buffer") - 4
     assert isinstance(value, Concrete) and value.value == expected
+
+
+
+def test_argument_at_a_call_site_inside_a_loop_resolves(probe_functions):
+    extractor = ParamExtractor()
+    report = extractor.extract_calls(probe_functions["target_func"], convention=CDECL, num_args=1)
+    sites = _sites_in(report, extractor.port, probe_functions["caller_in_loop"])
+    assert len(sites) == 1
+    value = sites[0].argument(0).raw_value
+    assert isinstance(value, Concrete), f"expected the pre-loop value to survive the back edge, got {value!r}"

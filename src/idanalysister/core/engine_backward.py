@@ -79,6 +79,26 @@ class _NotFound:
 _NOT_FOUND = _NotFound()
 
 
+class _CycleClosed:
+    """Sentinel for a backward path that looped back to a block already on
+    the current path.
+
+    Such a path carries *no information*: every block along it has already
+    been scanned for a definition by the time the cycle is detected (the
+    visited check fires only after the block's own instructions are
+    walked), so reaching the start again just means "this way in comes from
+    inside the loop". Treating it as `Unknown` instead would poison the
+    join with the genuinely informative predecessors — which is why a value
+    set before a loop and used inside it used to resolve to nothing."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - cosmetic
+        return "<cycle>"
+
+
+_CYCLE = _CycleClosed()
+
 
 @dataclass
 class ResolutionBudget:
@@ -184,7 +204,10 @@ class BackwardResolver:
         block = cfg.block_containing(before_ea) if not cfg.is_empty() else None
         if block is None:
             return self._walk_register_linear(reg, before_ea, func_ea)
-        return self._walk_register_block(reg, before_ea, block, func_ea, cfg, frozenset())
+        result = self._walk_register_block(reg, before_ea, block, func_ea, cfg, frozenset())
+        if result is _CYCLE:
+            return unknown(UnknownReason.NO_DEFINITION_FOUND, detail="every path into this block loops back")
+        return result
 
     def _walk_register_linear(self, reg: int, boundary_ea: int, func_ea: int) -> ValueLattice:
         ea = self.port.prev_head(boundary_ea, func_ea)
@@ -219,7 +242,7 @@ class BackwardResolver:
                     return result
             ea = self.port.prev_head(ea, block.start_ea)
         if block.start_ea in visited_blocks:
-            return unknown(UnknownReason.BUDGET_EXCEEDED, detail="cyclic backward path")
+            return _CYCLE
         preds = cfg.predecessors(block)
         if not preds:
             return unknown(UnknownReason.NO_DEFINITION_FOUND)
@@ -229,7 +252,13 @@ class BackwardResolver:
         results = [
             self._walk_register_block(reg, pred.end_ea, pred, func_ea, cfg, next_visited) for pred in preds
         ]
-        return join_all(results)
+        # Drop cycle-closing paths before joining: they contribute nothing,
+        # and `join` is absorbing on `Unknown`, so leaving them in would
+        # discard whatever the real predecessors proved.
+        informative = [r for r in results if r is not _CYCLE]
+        if not informative:
+            return _CYCLE
+        return join_all(informative)
 
     def _match_register_definition(self, instr: Instruction, reg: int, func_ea: int) -> ValueLattice | None:
         for op in instr.operands:
@@ -253,6 +282,10 @@ class BackwardResolver:
                 found = self._walk_memory_linear(query_key, before_ea, func_ea)
             else:
                 found = self._walk_memory_block(query_key, before_ea, block, func_ea, cfg, frozenset())
+            if found is _CYCLE:
+                # No write found anywhere reachable — same outcome as never
+                # having found one.
+                found = _NOT_FOUND
         if found is not _NOT_FOUND:
             return found
         return self._fallback_dereference(base_reg, disp, before_ea, size)
@@ -290,7 +323,7 @@ class BackwardResolver:
                     return result
             ea = self.port.prev_head(ea, block.start_ea)
         if block.start_ea in visited_blocks:
-            return _NOT_FOUND
+            return _CYCLE
         preds = cfg.predecessors(block)
         if not preds:
             return _NOT_FOUND
@@ -300,10 +333,16 @@ class BackwardResolver:
         results = [
             self._walk_memory_block(query_key, pred.end_ea, pred, func_ea, cfg, next_visited) for pred in preds
         ]
-        found = [r for r in results if r is not _NOT_FOUND]
+        # A cycle-closing path is not evidence that the location is
+        # undefined on that path — it is no evidence at all, so it must not
+        # count towards "defined on some paths but not others".
+        informative = [r for r in results if r is not _CYCLE]
+        if not informative:
+            return _CYCLE
+        found = [r for r in informative if r is not _NOT_FOUND]
         if not found:
             return _NOT_FOUND
-        if len(found) != len(results):
+        if len(found) != len(informative):
             return unknown(
                 UnknownReason.DIVERGENT_PATHS,
                 detail="memory location defined on some incoming paths but not others",

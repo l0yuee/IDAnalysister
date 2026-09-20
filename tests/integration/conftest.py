@@ -91,6 +91,7 @@ def probe_functions(ida_session):
         "decrypt_then_call",
         "caller_tail_call",
         "caller_sib_shadow",
+        "caller_in_loop",
         "caller_neg_disp",
     ]
     result = {}

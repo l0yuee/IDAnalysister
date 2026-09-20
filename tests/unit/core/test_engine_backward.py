@@ -395,3 +395,49 @@ def test_indexed_source_operand_is_not_flattened_to_its_base(port):
     linear_block(port)
     result = make_resolver(port).resolve_register(EAX, 0x401008)
     assert isinstance(result, Unknown) and result.reason is UnknownReason.UNSUPPORTED_OPERAND_SHAPE
+
+
+# -- values used inside a loop ---------------------------------------------------------
+
+def test_register_set_before_a_loop_resolves_at_a_use_inside_it(port):
+    # The back edge into the loop header used to come back as
+    # Unknown(BUDGET_EXCEEDED), and `join` is absorbing on Unknown, so it
+    # poisoned the one predecessor that actually proved the value. Every
+    # call site inside a loop was affected.
+    port.add_instructions(
+        [
+            insn(0x401000, "mov", 5, [reg(0, ESI), imm(1, 0x404000)]),
+            insn(0x401005, "push", 1, [reg(0, ESI)], written=(False,)),
+            insn(0x401006, "jmp", 2, [mem_direct(0, 0x401005)], written=(False,)),
+        ]
+    )
+    port.set_function(
+        FUNC,
+        END,
+        blocks=(
+            BasicBlockInfo(0x401000, 0x401005, succ_starts=(0x401005,), pred_starts=()),
+            BasicBlockInfo(0x401005, END, succ_starts=(0x401005,), pred_starts=(0x401000, 0x401005)),
+        ),
+    )
+    result = make_resolver(port).resolve_register(ESI, 0x401005)
+    assert isinstance(result, Concrete) and result.value == 0x404000
+
+
+def test_stack_slot_written_before_a_loop_resolves_inside_it(port):
+    port.add_instructions(
+        [
+            insn(0x401000, "mov", 5, [mem_displ(0, EBP, -8), imm(1, 0x777)]),
+            insn(0x401005, "mov", 3, [reg(0, EAX), mem_displ(1, EBP, -8)]),
+            insn(0x401008, "jmp", 2, [mem_direct(0, 0x401005)], written=(False,)),
+        ]
+    )
+    port.set_function(
+        FUNC,
+        END,
+        blocks=(
+            BasicBlockInfo(0x401000, 0x401005, succ_starts=(0x401005,), pred_starts=()),
+            BasicBlockInfo(0x401005, END, succ_starts=(0x401005,), pred_starts=(0x401000, 0x401005)),
+        ),
+    )
+    result = make_resolver(port).resolve_register(EAX, 0x401005 + 3)
+    assert isinstance(result, Concrete) and result.value == 0x777

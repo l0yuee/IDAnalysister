@@ -91,6 +91,19 @@ caller_sib_shadow:
     add esp, 0x10
     ret
 
+; A call site inside a loop. The value is set once before the loop; the
+; back edge into the loop header must not poison the resolution.
+caller_in_loop:
+    mov esi, global_val
+    mov edi, 4
+.loop:
+    push esi
+    call target_func
+    add esp, 4
+    dec edi
+    jnz .loop
+    ret
+
 ; Negative displacement (IDA widens it to a sign-extended 64-bit ea_t even
 ; in a 32-bit database) and an 8-bit partial write to a tracked register.
 caller_neg_disp:
@@ -103,6 +116,7 @@ caller_neg_disp:
 
 _start:
     call caller_sib_shadow
+    call caller_in_loop
     call caller_neg_disp
     call caller_push_seq
     call caller_reg_indirect
