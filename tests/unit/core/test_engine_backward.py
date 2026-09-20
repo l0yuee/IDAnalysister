@@ -94,9 +94,23 @@ def test_register_indirect_write_then_read(port):
 
 
 # -- form #7: TLS / global passing ------------------------------------------------------
-def test_tls_style_segment_operand_reads_configured_memory(port):
+def test_tls_segment_operand_is_not_read_as_a_flat_address(port):
+    # `mov eax, gs:[0x30]` names offset 0x30 *within the TLS segment*,
+    # whose base is not statically known. Reading linear address 0x30
+    # instead would silently report whatever unrelated data happens to
+    # live there, so the honest answer is a reasoned Unknown.
     port.set_memory(0x30, (0xCAFEBABE).to_bytes(4, "little"))
     port.add_instructions([insn(0x401000, "mov", 6, [reg(0, EAX), mem_direct(1, 0x30, segment_name="gs")])])
+    linear_block(port)
+    result = make_resolver(port).resolve_register(EAX, 0x401006)
+    assert isinstance(result, Unknown) and result.reason is UnknownReason.UNSUPPORTED_OPERAND_SHAPE
+    assert "gs" in result.detail
+
+
+
+def test_plain_global_without_segment_override_still_reads_memory(port):
+    port.set_memory(0x403000, (0xCAFEBABE).to_bytes(4, "little"))
+    port.add_instructions([insn(0x401000, "mov", 6, [reg(0, EAX), mem_direct(1, 0x403000)])])
     linear_block(port)
     result = make_resolver(port).resolve_register(EAX, 0x401006)
     assert isinstance(result, MemoryRef) and result.value.value == 0xCAFEBABE
@@ -330,3 +344,54 @@ def test_add_of_a_negative_immediate_wraps_to_the_register_width(port):
     linear_block(port)
     result = make_resolver(port).resolve_register(EBX, 0x401008)
     assert isinstance(result, Concrete) and result.value == 0x403FF8
+
+
+# -- memory shapes that name no single static address ----------------------------------
+
+def test_indexed_write_elsewhere_does_not_shadow_a_stack_argument(port):
+    # `mov [ebx+ecx*4], 0x99` writes into a table through ebx. It used to
+    # decode as `[esp+0]` (IDA reports the ModRM SIB marker, not the base),
+    # so it shadowed the real argument written by `mov [esp], 0x1234` and
+    # the call site reported 0x99.
+    port.add_instructions(
+        [
+            insn(0x401000, "mov", 7, [mem_displ(0, ESP, 0), imm(1, 0x1234)]),
+            insn(0x401007, "mov", 7, [mem_index(0, EBX, ECX, scale=4), imm(1, 0x99)]),
+            insn(0x40100E, "call", 5, [mem_direct(0, 0x402000)], written=(False,)),
+        ]
+    )
+    linear_block(port)
+    for ea in (0x401000, 0x401007, 0x40100E):
+        port.set_sp_delta(FUNC, ea, 0)
+    result = make_resolver(port).resolve_memory(ESP, 0, 0x40100E, 4)
+    assert isinstance(result, Concrete) and result.value == 0x1234
+
+
+def test_indexed_write_in_the_same_region_is_reported_as_possible_aliasing(port):
+    # `mov [esp+ecx*4], 0x99` really might land on [esp+0]; reporting the
+    # older write would be a guess.
+    port.add_instructions(
+        [
+            insn(0x401000, "mov", 7, [mem_displ(0, ESP, 0), imm(1, 0x1234)]),
+            insn(0x401007, "mov", 7, [mem_index(0, ESP, ECX, scale=4), imm(1, 0x99)]),
+        ]
+    )
+    linear_block(port)
+    for ea in (0x401000, 0x401007, 0x40100E):
+        port.set_sp_delta(FUNC, ea, 0)
+    result = make_resolver(port).resolve_memory(ESP, 0, 0x40100E, 4)
+    assert isinstance(result, Unknown) and result.reason is UnknownReason.UNSUPPORTED_OPERAND_SHAPE
+    assert "alias" in result.detail
+
+
+def test_indexed_source_operand_is_not_flattened_to_its_base(port):
+    port.set_memory(0x404000, (0xDEAD).to_bytes(4, "little"))
+    port.add_instructions(
+        [
+            insn(0x401000, "mov", 5, [reg(0, EBX), imm(1, 0x404000)]),
+            insn(0x401005, "mov", 3, [reg(0, EAX), mem_index(1, EBX, ECX, scale=4)]),
+        ]
+    )
+    linear_block(port)
+    result = make_resolver(port).resolve_register(EAX, 0x401008)
+    assert isinstance(result, Unknown) and result.reason is UnknownReason.UNSUPPORTED_OPERAND_SHAPE

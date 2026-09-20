@@ -127,7 +127,7 @@ Built-in locators, one small module per family:
 |---|---|
 | `register_locators.py` | `mov reg,reg` / `mov reg,imm` / `lea reg,[global]` / `xchg` / `cmov` |
 | `arithmetic_locators.py` | `lea reg,[base+disp]` / `add`,`sub reg,imm` (constant folding) |
-| `memory_locators.py` | `mov reg,[mem]` — global, `[reg+off]`, TLS (`gs:`/`fs:`) |
+| `memory_locators.py` | `mov reg,[mem]` — global, `[reg+off]` |
 | `immediate_locators.py` | `mov [mem],imm` |
 | `stack_locators.py` | `push` (any operand shape) / `mov [mem],reg` |
 | `call_return_locators.py` | prior call's return register used as an argument |
@@ -169,7 +169,11 @@ work without a `Locator` needing to special-case call semantics itself.
   displacements are used directly (stable across the function), and
   arbitrary-register-relative accesses are matched by literal `(reg, disp)`
   identity — a documented approximation (no general pointer-aliasing
-  analysis). It searches backward for the nearest matching write; only if
+  analysis). A reference is split into a *space* (which region it is
+  relative to) and an *offset* within it, so an indexed write
+  (`mov [esp+eax*4], edx`) — which has a known space but an unknowable
+  offset — can be reported as possibly aliasing the query instead of
+  being either ignored or flattened to offset zero. It searches backward for the nearest matching write; only if
   none is found does it fall back to reading the IDB's static byte content
   (correct for true globals; for stack/heap-relative queries with no local
   write, the honest answer is `Unknown(NO_DEFINITION_FOUND)`, since raw

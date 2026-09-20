@@ -79,6 +79,7 @@ class _NotFound:
 _NOT_FOUND = _NotFound()
 
 
+
 @dataclass
 class ResolutionBudget:
     """Per-top-level-query bound shared across every recursive callback a
@@ -310,33 +311,68 @@ class BackwardResolver:
         return join_all(found)
 
     def _match_memory_definition(self, instr: Instruction, query_key: tuple, func_ea: int) -> ValueLattice | None:
+        query_space, _query_offset = query_key
         for op in instr.operands:
             if not op.is_memory or not instr.is_written(op.number):
                 continue
             if op.kind is OperandKind.MEM_DIRECT:
-                key = self._normalize_memory_key(None, op.addr, instr.ea, func_ea)
+                space, offset = self._memory_location(None, op.addr, instr.ea, func_ea)
             elif op.reg is not None:
-                key = self._normalize_memory_key(op.reg, op.disp, instr.ea, func_ea)
+                space, offset = self._memory_location(op.reg, op.disp, instr.ea, func_ea)
             else:
                 continue
-            if key != query_key:
+            if op.segment_name:
+                # A write through fs:/gs: has no statically known linear
+                # address, so it gets its own space: it can neither satisfy
+                # nor shadow a default-segment query.
+                space = (op.segment_name,) + space
+            if op.has_index:
+                # A runtime index means this write lands on *some* cell of
+                # `space` that we cannot pin down. If the query lives in
+                # the same space, the write may well be the one that
+                # defined it — walking past it to an older write would be
+                # exactly the kind of guess this framework must not make.
+                # A different space falls under the same no-aliasing
+                # approximation that `(base, disp)` identity matching
+                # already documents.
+                if space == query_space:
+                    return unknown(
+                        UnknownReason.UNSUPPORTED_OPERAND_SHAPE,
+                        detail=f"indexed write at {instr.ea:#x} may alias the queried location",
+                    )
+                continue
+            if (space, offset) != query_key:
                 continue
             return self._interpret_definition(instr, op.number, func_ea)
         return None
 
-    def _normalize_memory_key(self, base_reg: int | None, disp: int, ea: int, func_ea: int) -> tuple:
+    def _memory_location(self, base_reg: int | None, disp: int, ea: int, func_ea: int) -> tuple[tuple, int]:
+        """Split a memory reference into `(space, offset)`: which region it
+        is relative to, and which cell within that region.
+
+        Two references name the same cell only if both halves match. The
+        split matters because an *indexed* reference has a known space but
+        an unknown offset, which is what lets `_match_memory_definition`
+        tell "may alias the query" apart from "provably a different
+        region"."""
         if base_reg is None:
-            return ("abs", disp)
+            return ("abs",), disp
         sp_reg = self.port.stack_pointer_reg()
         if sp_reg is not None and base_reg == sp_reg:
             delta = self.port.get_sp_delta(func_ea, ea)
             if delta is None:
-                return ("sp-unknown", base_reg, disp, ea)
-            return ("sp", delta + disp)
+                # Without a stack delta this reference cannot be compared
+                # with any other; give it a space of its own keyed by its
+                # own address so it matches nothing, including itself.
+                return ("sp-unknown", ea), disp
+            return ("sp",), delta + disp
         fp_reg = self.port.frame_pointer_reg()
         if fp_reg is not None and base_reg == fp_reg:
-            return ("fp", disp)
-        return ("reg", base_reg, disp)
+            return ("fp",), disp
+        return ("reg", base_reg), disp
+
+    def _normalize_memory_key(self, base_reg: int | None, disp: int, ea: int, func_ea: int) -> tuple:
+        return self._memory_location(base_reg, disp, ea, func_ea)
 
     def _fallback_dereference(self, base_reg: int | None, disp: int, before_ea: int, size: int) -> ValueLattice:
         if base_reg is None:

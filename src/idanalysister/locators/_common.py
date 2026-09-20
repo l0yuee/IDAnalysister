@@ -33,8 +33,40 @@ def wrap_to_width(value: int, size_bytes: int) -> int:
     return value & ((1 << (width * 8)) - 1)
 
 
+def unsupported_address_shape(op: Operand) -> ValueLattice | None:
+    """`Unknown` if this memory operand cannot be reduced to a single
+    static `(base, disp)` location, else `None`.
+
+    Two shapes qualify, and both used to be silently flattened into an
+    ordinary `(base, disp)` pair:
+
+    * **Indexed addressing** (`[base+index*scale+disp]`). The index is a
+      runtime value, so the operand names a *family* of addresses, not one
+      cell. Dropping it turns an array element access into an access to
+      element zero.
+    * **A non-default segment override** (`fs:`/`gs:`, i.e. TLS). The
+      displacement is an offset within a segment whose base is not known
+      statically, so it is not a linear address and must not be read as
+      one.
+    """
+    if op.has_index:
+        return unknown(
+            UnknownReason.UNSUPPORTED_OPERAND_SHAPE,
+            detail=f"indexed addressing [base+reg{op.index_reg}*{op.scale}] has no single static address",
+        )
+    if op.segment_name:
+        return unknown(
+            UnknownReason.UNSUPPORTED_OPERAND_SHAPE,
+            detail=f"{op.segment_name}:-relative address has no statically known linear equivalent",
+        )
+    return None
+
+
 def load_memory_operand(op: Operand, ctx: ResolutionContext, before_ea: int) -> ValueLattice:
     """Resolve the value referenced by a memory operand of any shape."""
+    rejected = unsupported_address_shape(op)
+    if rejected is not None:
+        return rejected
     size = op.dtype_size or ctx.port.pointer_size()
     if op.kind is OperandKind.MEM_DIRECT:
         return ctx.resolve_memory(None, op.addr, before_ea, size)

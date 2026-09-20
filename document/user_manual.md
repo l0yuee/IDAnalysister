@@ -471,7 +471,7 @@ if not arg.raw_value.is_known:
 | `DIVERGENT_PATHS` / `DIVERGENT_SYMBOLIC` | Two control-flow paths disagree on the value. | Not a bug — the framework refuses to guess. Consider `resolve_argument_at` with a `target_ea` on the specific path you care about. |
 | `BUDGET_EXCEEDED` | Hit the step/block cap. | Raise `max_steps`/`max_blocks` (§3.10). |
 | `UNSUPPORTED_INSTRUCTION` | No `Locator` recognizes this instruction as a definition. | Add one — §3.7. |
-| `UNSUPPORTED_OPERAND_SHAPE` | A locator matched the mnemonic but not this exact operand combination (or an argument slot couldn't be resolved to a register/offset at all). | Often a convention mismatch — double check `convention`/`num_args`; otherwise extend the matching locator. |
+| `UNSUPPORTED_OPERAND_SHAPE` | A locator matched the mnemonic but not this exact operand combination; an argument slot couldn't be resolved to a register/offset at all; the operand is indexed (`[base+index*scale]`) or `fs:`/`gs:`-relative, so it names no single static address; or an indexed write may have aliased the queried location. | Read `detail` — it names the instruction and the exact reason. A convention mismatch is the most common cause, so check `convention`/`num_args` first; otherwise extend the matching locator. |
 | `MEMORY_READ_FAILED` | The computed address has no data in the IDB. | Expected for stack/heap addresses with no local definition, or truly unmapped regions. |
 | `INDIRECT_CONTROL_FLOW` | Reserved for indirect call/jump cases that break static certainty. | Informational. |
 | `LOOP_NON_CONVERGENT` | A forward-tracked value kept changing across loop iterations without stabilizing. | The value genuinely isn't a single constant at that point. |
@@ -529,7 +529,12 @@ extending the framework or debugging its behavior.
 - **`locators.arithmetic_locators`** — `lea reg,[base+disp]`/
   `add`,`sub reg,imm` (constant folding, both backward and forward).
 - **`locators.memory_locators`** — `mov reg,[mem]` in every addressing
-  shape (global, `[reg+off]`, TLS).
+  shape that names one static cell (global, `[reg+off]`). Indexed
+  (`[base+index*scale]`) and `fs:`/`gs:`-relative operands resolve to
+  `Unknown(UNSUPPORTED_OPERAND_SHAPE)`: the first names a whole family of
+  addresses, the second an offset into a segment whose base the database
+  does not know.
+
 - **`locators.immediate_locators`** — `mov [mem],imm`.
 - **`locators.stack_locators`** — `push` (any operand shape),
   `mov [mem],reg`.

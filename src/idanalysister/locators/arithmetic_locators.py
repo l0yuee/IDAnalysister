@@ -41,6 +41,9 @@ class LeaRegDisplLocator(Locator):
             and dst.kind is OperandKind.REG
             and src.kind in (OperandKind.MEM_DISPL, OperandKind.MEM_PHRASE)
             and src.reg is not None
+            # `lea eax, [ebx+ecx*4]` depends on a runtime index; folding it
+            # as `ebx+0` would fabricate a pointer to the wrong element.
+            and not src.has_index
         )
 
     def extract(self, instr: Instruction, dest_operand: int, ctx: ResolutionContext) -> LocatorOutcome:
